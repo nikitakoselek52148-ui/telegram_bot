@@ -1,6 +1,8 @@
 import asyncio
 import os
 import logging
+import base64
+import io
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -19,10 +21,16 @@ logger = logging.getLogger(__name__)
 
 user_histories = {}
 
+# Мультимодальная модель для распознавания текста с фото
+VISION_MODEL = "google/gemini-2.5-flash-lite-preview-03-25:free"
+# Обычная модель для чата
+TEXT_MODEL = "openrouter/free"
+
 async def get_ai_response(user_id: int, user_message: str) -> str:
+    """Обычный чат с текстом"""
     if user_id not in user_histories:
         user_histories[user_id] = [
-            {"role": "system", "content": "Ты полезный AI-ассистент. Отвечай на русском языке."}
+            {"role": "system", "content": "Ты полезный AI-ассистент. Отвечай на русском языке кратко и по делу."}
         ]
     
     user_histories[user_id].append({"role": "user", "content": user_message})
@@ -37,7 +45,7 @@ async def get_ai_response(user_id: int, user_message: str) -> str:
         }
         
         data = {
-            "model": "openrouter/free",
+            "model": TEXT_MODEL,
             "messages": user_histories[user_id],
             "max_tokens": 1000,
             "temperature": 0.7
@@ -59,22 +67,94 @@ async def get_ai_response(user_id: int, user_message: str) -> str:
                 else:
                     error_text = await response.text()
                     logger.error(f"Ошибка API: {response.status} - {error_text}")
-                    return f"❌ Ошибка API: {response.status}. Попробуйте позже."
+                    return f"❌ Ошибка API: {response.status}"
                     
         except asyncio.TimeoutError:
-            return "⏰ Превышено время ожидания ответа. Попробуйте ещё раз."
+            return "⏰ Превышено время ожидания. Попробуйте ещё раз."
         except Exception as e:
-            logger.error(f"Неожиданная ошибка: {e}")
-            return f"❌ Произошла ошибка: {e}"
+            logger.error(f"Ошибка: {e}")
+            return f"❌ Ошибка: {e}"
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+async def analyze_photo_with_vision(image_bytes: bytes, user_question: str = None) -> str:
+    """
+    Отправляет фото в мультимодальную модель для анализа
+    Если user_question есть — модель отвечает на вопрос
+    Если нет — просто извлекает весь текст
+    """
+    
+    # Конвертируем фото в base64
+    image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+    
+    # Формируем запрос
+    if user_question:
+        prompt = f"Посмотри на это фото и ответь на вопрос: {user_question}"
+    else:
+        prompt = "Извлеки и распознай весь текст с этого фото. Напиши только распознанный текст, без лишних комментариев."
+    
+    async with aiohttp.ClientSession() as session:
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        # Формат запроса для мультимодальной модели
+        data = {
+            "model": VISION_MODEL,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": prompt
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_base64}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            "max_tokens": 2000,
+            "temperature": 0.3  # Низкая температура для точного распознавания
+        }
+        
+        try:
+            async with session.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json=data,
+                timeout=aiohttp.ClientTimeout(total=90)
+            ) as response:
+                
+                if response.status == 200:
+                    result = await response.json()
+                    return result["choices"][0]["message"]["content"]
+                else:
+                    error_text = await response.text()
+                    logger.error(f"Vision API ошибка: {response.status} - {error_text}")
+                    return None
+                    
+        except Exception as e:
+            logger.error(f"Vision ошибка: {e}")
+            return None
+
+# --- Обработчики сообщений ---
 
 @dp.message(Command("start"))
 async def start_command(message: types.Message):
     await message.answer(
         "🤖 Привет! Я бот с доступом к нейросетям через OpenRouter.\n\n"
-        "Просто напиши мне любое сообщение, и я отвечу!\n\n"
+        "📝 **Что я умею:**\n"
+        "• Отвечать на текстовые сообщения\n"
+        "• 📸 Распознавать текст с фотографий\n"
+        "• Отвечать на вопросы по фото\n\n"
+        "**Как пользоваться:**\n"
+        "• Просто напиши текст — я отвечу\n"
+        "• Отправь фото — я распознаю текст\n"
+        "• Отправь фото с вопросом в подписи — отвечу по фото\n\n"
         "/clear — очистить историю диалога"
     )
 
@@ -85,6 +165,46 @@ async def clear_history(message: types.Message):
         user_histories[user_id] = [user_histories[user_id][0]]
     await message.answer("🧹 История диалога очищена!")
 
+# Обработчик фотографий
+@dp.message(lambda msg: msg.photo is not None)
+async def handle_photo(message: types.Message):
+    user_id = message.from_user.id
+    
+    # Показываем статус "печатает"
+    await bot.send_chat_action(user_id, "typing")
+    
+    # Получаем вопрос из подписи к фото (если есть)
+    user_question = message.caption if message.caption else None
+    
+    # Отправляем временное сообщение
+    status_msg = await message.answer("📷 Получил фото! Анализирую...")
+    
+    # Скачиваем фото
+    photo = message.photo[-1]  # Самое большое фото
+    file = await bot.get_file(photo.file_id)
+    
+    photo_bytes = io.BytesIO()
+    await bot.download_file(file.file_path, destination=photo_bytes)
+    photo_bytes.seek(0)
+    
+    # Отправляем в мультимодальную модель
+    result = await analyze_photo_with_vision(photo_bytes.getvalue(), user_question)
+    
+    await status_msg.delete()
+    
+    if result:
+        # Если результат длинный — обрезаем
+        if len(result) > 4000:
+            result = result[:4000] + "\n\n...(текст обрезан)"
+        
+        if user_question:
+            await message.answer(f"📸 **Ответ по фото:**\n\n{result}")
+        else:
+            await message.answer(f"📝 **Распознанный текст:**\n\n{result}")
+    else:
+        await message.answer("❌ Не удалось распознать текст на фото. Попробуйте сделать фото чётче или используйте другое освещение.")
+
+# Обработчик текстовых сообщений
 @dp.message()
 async def handle_message(message: types.Message):
     user_id = message.from_user.id
@@ -94,8 +214,9 @@ async def handle_message(message: types.Message):
     response = await get_ai_response(user_id, user_text)
     await message.answer(response)
 
+# Запуск бота
 async def main():
-    logger.info("Бот запущен!")
+    logger.info("Бот запущен с поддержкой фото через мультимодальную модель!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
