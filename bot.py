@@ -46,7 +46,7 @@ user_histories = {}
 # Модели
 VISION_MODEL = "nvidia/nemotron-nano-12b-v2-vl:free"
 TEXT_MODEL = "openrouter/free"
-IMAGE_MODEL = "flux-schnell:free"  # Бесплатная модель для генерации картинок
+IMAGE_MODEL = "google/gemini-3.1-flash-image-preview:free"  # Бесплатная модель для генерации картинок
 
 # --- Клавиатура с кнопками ---
 def get_main_keyboard():
