@@ -15,6 +15,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+HF_TOKEN = os.getenv("HF_TOKEN")
 
 if not BOT_TOKEN or not OPENROUTER_API_KEY:
     raise ValueError("Токены не найдены!")
@@ -42,7 +43,7 @@ dp = Dispatcher()
 user_histories = {}
 
 # Модели
-TEXT_MODEL = "mistralai/mistral-small-3.2-24b-instruct:free"
+TEXT_MODEL = "google/gemma-3-12b-it:free"
 VISION_MODEL = "google/gemma-3-27b-it:free"
 
 # --- Клавиатура ---
@@ -111,18 +112,17 @@ async def get_ai_response(user_id: int, user_message: str) -> str:
             logger.error(f"Ошибка: {e}")
             return f"❌ Ошибка: {e}"
 
-# --- Генерация картинки через бесплатный API (Hugging Face) ---
+# --- Генерация картинки через Hugging Face ---
 async def generate_image(prompt: str):
-    """Генерирует картинку через бесплатный Hugging Face API"""
+    """Генерирует картинку через Hugging Face"""
     
-    # Используем бесплатную модель на Hugging Face
-    api_url = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-dev"
+    API_URL = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-dev"
     
     headers = {
-        "Authorization": f"Bearer {os.getenv('HF_TOKEN', 'hf_fake')}"
+        "Authorization": f"Bearer {HF_TOKEN}",
+        "Content-Type": "application/json"
     }
     
-    # Пробуем без токена сначала (публичные модели)
     async with aiohttp.ClientSession() as session:
         try:
             payload = {
@@ -135,37 +135,20 @@ async def generate_image(prompt: str):
             }
             
             async with session.post(
-                api_url,
-                headers={"Content-Type": "application/json"},
+                API_URL,
+                headers=headers,
                 json=payload,
                 timeout=aiohttp.ClientTimeout(total=120)
             ) as response:
                 if response.status == 200:
                     return await response.read()
                 else:
-                    logger.error(f"HF ошибка: {response.status}")
-                    # Пробуем альтернативный сервис
-                    return await generate_image_alt(prompt)
+                    error_text = await response.text()
+                    logger.error(f"HF ошибка {response.status}: {error_text}")
+                    return None
         except Exception as e:
             logger.error(f"Ошибка генерации: {e}")
-            return await generate_image_alt(prompt)
-
-# Альтернативный бесплатный генератор (без ключа)
-async def generate_image_alt(prompt: str):
-    """Резервный генератор через pollinations (другой эндпоинт)"""
-    encoded_prompt = prompt.replace(" ", "%20")
-    url = f"https://pollinations.ai/p/{encoded_prompt}?width=512&height=512&seed=42&nologo=true"
-    
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as response:
-                if response.status == 200:
-                    return await response.read()
-                else:
-                    return None
-    except Exception as e:
-        logger.error(f"Alt ошибка: {e}")
-        return None
+            return None
 
 # --- Распознавание фото ---
 async def analyze_photo(image_bytes: bytes) -> str:
@@ -224,7 +207,7 @@ async def start_command(message: types.Message):
         "Вот что я умею:\n"
         "• 💬 **Общаться** — просто напиши мне сообщение\n"
         "• 📸 **Распознавать текст с фото** — отправь картинку\n"
-        "• 🎨 **Генерировать картинки** — нажми кнопку или напиши 'нарисуй ...'\n\n"
+        "• 🎨 **Генерировать картинки** — напиши 'нарисуй ...'\n\n"
         "👇 **Используй кнопки ниже**",
         reply_markup=get_main_keyboard(),
         parse_mode="Markdown"
@@ -249,8 +232,7 @@ async def handle_callback(callback: CallbackQuery):
         await callback.message.answer(
             "🎨 **Что нарисовать?**\n\n"
             "Напиши в одном сообщении:\n"
-            "`нарисуй кота в космосе`\n\n"
-            "Доступные стили: реализм, аниме, фэнтези."
+            "`нарисуй кота в космосе`"
         )
     elif callback.data == "clear":
         if user_id in user_histories:
@@ -263,10 +245,9 @@ async def handle_callback(callback: CallbackQuery):
             "• **Распознать фото** — отправь картинку\n"
             "• **Сгенерировать картинку** — напиши 'нарисуй ...'\n"
             "• **Очистить историю** — бот забудет предыдущие сообщения\n\n"
-            "🔹 **Примеры запросов:**\n"
+            "🔹 **Примеры:**\n"
             "- `нарисуй закат на море`\n"
-            "- `Что такое ИИ?`\n"
-            "- `нарисуй кота в шляпе`"
+            "- `Что такое ИИ?`"
         )
     await callback.answer()
 
@@ -289,7 +270,7 @@ async def handle_generate(message: types.Message):
         photo_file = BufferedInputFile(image_data, filename="image.png")
         await message.answer_photo(photo=photo_file, caption=f"🖼 *{prompt}*", parse_mode="Markdown")
     else:
-        await message.answer("❌ Не удалось сгенерировать картинку. Попробуйте другой запрос.\n\nСовет: напишите запрос подробнее, например 'нарисуй рыжего кота в космическом скафандре'")
+        await message.answer("❌ Не удалось сгенерировать картинку. Попробуйте другой запрос.")
 
 @dp.message(lambda msg: msg.photo is not None)
 async def handle_photo(message: types.Message):
@@ -325,7 +306,7 @@ async def handle_message(message: types.Message):
     await message.answer(response)
 
 async def main():
-    logger.info("Бот запущен с Mistral и генерацией картинок!")
+    logger.info("Бот запущен с Hugging Face генерацией картинок!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
