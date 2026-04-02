@@ -43,7 +43,7 @@ dp = Dispatcher()
 user_histories = {}
 
 # Модели
-VISION_MODEL = "google/gemini-2.5-flash-lite-preview-03-25:free"
+VISION_MODEL = "google/gemini-2.0-flash-exp:free"
 TEXT_MODEL = "openrouter/free"
 
 async def get_ai_response(user_id: int, user_message: str) -> str:
