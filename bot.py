@@ -41,9 +41,9 @@ dp = Dispatcher()
 
 user_histories = {}
 
-# Модели
-TEXT_MODEL = "nvidia/gpt-oss-120b:free"
-VISION_MODEL = "google/gemma-3-27b-it:free"
+# ✅ МОДЕЛИ (ИСПРАВЛЕНЫ)
+TEXT_MODEL = "deepseek/deepseek-chat-v3-0324:free"  # DeepSeek V3 - бесплатно и умно
+VISION_MODEL = "google/gemma-3-27b-it:free"  # Для распознавания фото
 
 # --- Клавиатура ---
 def get_main_keyboard():
@@ -62,7 +62,7 @@ def get_main_keyboard():
     ])
     return keyboard
 
-# --- Текстовый чат ---
+# --- Текстовый чат с DeepSeek V3 ---
 async def get_ai_response(user_id: int, user_message: str) -> str:
     if user_id not in user_histories:
         user_histories[user_id] = [
@@ -111,26 +111,17 @@ async def get_ai_response(user_id: int, user_message: str) -> str:
             logger.error(f"Ошибка: {e}")
             return f"❌ Ошибка: {e}"
 
-# --- Генерация картинки через Pollinations.ai (бесплатно!) ---
-async def generate_image(prompt: str) -> str:
+# --- Генерация картинки через Pollinations.ai ---
+async def generate_image(prompt: str):
     """Генерирует картинку через Pollinations.ai - бесплатно, без ключа"""
-    
-    # Кодируем prompt для URL
     encoded_prompt = prompt.replace(" ", "%20")
-    
-    # Pollinations API (бесплатный, без регистрации)
-    # Разные модели на выбор:
-    # flux, turbo, flux-realism, any-dark, realvis, dreamshaper
-    
     url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?model=flux&width=1024&height=1024&nologo=true"
     
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as response:
                 if response.status == 200:
-                    # Сохраняем картинку в память
-                    image_data = await response.read()
-                    return image_data
+                    return await response.read()
                 else:
                     logger.error(f"Pollinations ошибка: {response.status}")
                     return None
@@ -195,7 +186,7 @@ async def start_command(message: types.Message):
         "Вот что я умею:\n"
         "• 💬 **Общаться** — просто напиши мне сообщение\n"
         "• 📸 **Распознавать текст с фото** — отправь картинку\n"
-        "• 🎨 **Генерировать картинки** — напиши 'нарисуй ...'\n\n"
+        "• 🎨 **Генерировать картинки** — нажми кнопку или напиши 'нарисуй ...'\n\n"
         "👇 **Используй кнопки ниже**",
         reply_markup=get_main_keyboard(),
         parse_mode="Markdown"
@@ -208,44 +199,51 @@ async def clear_history_command(message: types.Message):
         user_histories[user_id] = [user_histories[user_id][0]]
     await message.answer("🧹 История диалога очищена!")
 
+# ✅ ОБРАБОТЧИК КНОПОК (ВКЛЮЧАЯ ГЕНЕРАЦИЮ)
 @dp.callback_query()
 async def handle_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
     
     if callback.data == "chat":
         await callback.message.answer("💬 Просто напиши мне любое сообщение, и я отвечу!")
+        await callback.answer()
+    
     elif callback.data == "photo":
         await callback.message.answer("📸 Отправь мне фото с текстом, и я распознаю его!")
+        await callback.answer()
+    
     elif callback.data == "generate":
         await callback.message.answer(
             "🎨 **Что нарисовать?**\n\n"
             "Напиши в одном сообщении:\n"
             "`нарисуй кота в космосе`\n\n"
-            "Доступные стили: реализм, аниме, фэнтези и другие.",
+            "Или просто нажми на кнопку и напиши свой запрос.",
             parse_mode="Markdown"
         )
+        await callback.answer()
+    
     elif callback.data == "clear":
         if user_id in user_histories:
             user_histories[user_id] = [user_histories[user_id][0]]
         await callback.message.answer("🧹 История диалога очищена!")
+        await callback.answer()
+    
     elif callback.data == "help":
         await callback.message.answer(
             "📖 **Помощь**\n\n"
             "• **Чат** — просто напиши текст\n"
             "• **Распознать фото** — отправь картинку\n"
-            "• **Сгенерировать картинку** — напиши 'нарисуй ...'\n"
+            "• **Сгенерировать картинку** — нажми кнопку или напиши 'нарисуй ...'\n"
             "• **Очистить историю** — бот забудет предыдущие сообщения\n\n"
             "🔹 **Примеры запросов:**\n"
             "- `нарисуй закат на море`\n"
             "- `Что такое ИИ?`\n"
             "- Отправь фото чека\n"
-            "- `нарисуй кота в шляпе`\n\n"
-            "🎨 **Стили генерации:**\n"
-            "Добавьте в конец запроса: стиль аниме, реализм, фэнтези"
+            "- `нарисуй кота в шляпе`"
         )
-    await callback.answer()
+        await callback.answer()
 
-# Генерация картинки
+# Генерация картинки по команде "нарисуй"
 @dp.message(lambda msg: msg.text and msg.text.lower().startswith("нарисуй"))
 async def handle_generate(message: types.Message):
     prompt = message.text.replace("нарисуй", "").strip()
@@ -260,13 +258,13 @@ async def handle_generate(message: types.Message):
     await status_msg.delete()
     
     if image_data:
-        # Отправляем картинку
         from aiogram.types import BufferedInputFile
         photo_file = BufferedInputFile(image_data, filename="image.png")
         await message.answer_photo(photo=photo_file, caption=f"🖼 *{prompt}*", parse_mode="Markdown")
     else:
-        await message.answer("❌ Не удалось сгенерировать картинку. Попробуйте другой запрос.\n\nВозможные причины: слишком длинный запрос или временные проблемы сервиса.")
+        await message.answer("❌ Не удалось сгенерировать картинку. Попробуйте другой запрос.")
 
+# Обработка фото
 @dp.message(lambda msg: msg.photo is not None)
 async def handle_photo(message: types.Message):
     await bot.send_chat_action(message.from_user.id, "typing")
@@ -291,6 +289,7 @@ async def handle_photo(message: types.Message):
     else:
         await message.answer("❌ Не удалось распознать текст. Попробуйте фото с более чётким текстом.")
 
+# Обработка текстовых сообщений
 @dp.message()
 async def handle_message(message: types.Message):
     user_id = message.from_user.id
@@ -301,7 +300,7 @@ async def handle_message(message: types.Message):
     await message.answer(response)
 
 async def main():
-    logger.info("Бот запущен с генерацией картинок через Pollinations.ai!")
+    logger.info("Бот запущен с DeepSeek V3 и генерацией картинок!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
