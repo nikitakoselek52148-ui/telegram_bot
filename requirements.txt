@@ -19,3 +19,4 @@ python-socks==2.8.1
 typing-inspection==0.4.2
 typing_extensions==4.15.0
 yarl==1.23.0
+Flask==3.1.2

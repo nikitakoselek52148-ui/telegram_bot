@@ -3,10 +3,12 @@ import os
 import logging
 import base64
 import io
+import threading
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 import aiohttp
+from flask import Flask
 
 load_dotenv()
 
@@ -25,6 +27,27 @@ user_histories = {}
 VISION_MODEL = "google/gemini-2.5-flash-lite-preview-03-25:free"
 # Обычная модель для чата
 TEXT_MODEL = "openrouter/free"
+
+# --- Веб-сервер для Render (чтобы не убивал процесс) ---
+web_app = Flask(__name__)
+
+@web_app.route('/')
+def health_check():
+    return "Bot is running!", 200
+
+@web_app.route('/health')
+def health():
+    return "OK", 200
+
+def run_web_server():
+    web_app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
+
+# Запускаем веб-сервер в отдельном потоке
+web_thread = threading.Thread(target=run_web_server, daemon=True)
+web_thread.start()
+logger.info("Веб-сервер для Render запущен на порту 10000")
+
+# --- Основная логика бота ---
 
 async def get_ai_response(user_id: int, user_message: str) -> str:
     """Обычный чат с текстом"""
@@ -76,16 +99,10 @@ async def get_ai_response(user_id: int, user_message: str) -> str:
             return f"❌ Ошибка: {e}"
 
 async def analyze_photo_with_vision(image_bytes: bytes, user_question: str = None) -> str:
-    """
-    Отправляет фото в мультимодальную модель для анализа
-    Если user_question есть — модель отвечает на вопрос
-    Если нет — просто извлекает весь текст
-    """
+    """Отправляет фото в мультимодальную модель для анализа"""
     
-    # Конвертируем фото в base64
     image_base64 = base64.b64encode(image_bytes).decode('utf-8')
     
-    # Формируем запрос
     if user_question:
         prompt = f"Посмотри на это фото и ответь на вопрос: {user_question}"
     else:
@@ -97,28 +114,22 @@ async def analyze_photo_with_vision(image_bytes: bytes, user_question: str = Non
             "Content-Type": "application/json"
         }
         
-        # Формат запроса для мультимодальной модели
         data = {
             "model": VISION_MODEL,
             "messages": [
                 {
                     "role": "user",
                     "content": [
-                        {
-                            "type": "text",
-                            "text": prompt
-                        },
+                        {"type": "text", "text": prompt},
                         {
                             "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{image_base64}"
-                            }
+                            "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}
                         }
                     ]
                 }
             ],
             "max_tokens": 2000,
-            "temperature": 0.3  # Низкая температура для точного распознавания
+            "temperature": 0.3
         }
         
         try:
@@ -170,30 +181,23 @@ async def clear_history(message: types.Message):
 async def handle_photo(message: types.Message):
     user_id = message.from_user.id
     
-    # Показываем статус "печатает"
     await bot.send_chat_action(user_id, "typing")
-    
-    # Получаем вопрос из подписи к фото (если есть)
     user_question = message.caption if message.caption else None
     
-    # Отправляем временное сообщение
     status_msg = await message.answer("📷 Получил фото! Анализирую...")
     
-    # Скачиваем фото
-    photo = message.photo[-1]  # Самое большое фото
+    photo = message.photo[-1]
     file = await bot.get_file(photo.file_id)
     
     photo_bytes = io.BytesIO()
     await bot.download_file(file.file_path, destination=photo_bytes)
     photo_bytes.seek(0)
     
-    # Отправляем в мультимодальную модель
     result = await analyze_photo_with_vision(photo_bytes.getvalue(), user_question)
     
     await status_msg.delete()
     
     if result:
-        # Если результат длинный — обрезаем
         if len(result) > 4000:
             result = result[:4000] + "\n\n...(текст обрезан)"
         
@@ -216,7 +220,7 @@ async def handle_message(message: types.Message):
 
 # Запуск бота
 async def main():
-    logger.info("Бот запущен с поддержкой фото через мультимодальную модель!")
+    logger.info("Бот запущен с поддержкой фото и веб-сервером для Render!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
