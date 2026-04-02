@@ -42,9 +42,9 @@ dp = Dispatcher()
 
 user_histories = {}
 
-# ✅ ИСПРАВЛЕННЫЕ МОДЕЛИ
-TEXT_MODEL = "nvidia/gpt-oss-120b:free"  # Рабочая модель для чата
-VISION_MODEL = "google/gemma-3-27b-it:free"
+# ✅ НОВЫЕ РАБОЧИЕ МОДЕЛИ (апрель 2026)
+TEXT_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"  # NVIDIA Nemotron 3 Super
+VISION_MODEL = "nvidia/nemotron-nano-2-vl:free"  # Для распознавания фото
 
 # --- Клавиатура ---
 def get_main_keyboard():
@@ -63,7 +63,7 @@ def get_main_keyboard():
     ])
     return keyboard
 
-# --- Текстовый чат ---
+# --- Текстовый чат с NVIDIA Nemotron 3 Super ---
 async def get_ai_response(user_id: int, user_message: str) -> str:
     if user_id not in user_histories:
         user_histories[user_id] = [
@@ -112,27 +112,45 @@ async def get_ai_response(user_id: int, user_message: str) -> str:
             logger.error(f"Ошибка: {e}")
             return f"❌ Ошибка: {e}"
 
-# --- Генерация картинки через бесплатный API (без токена) ---
+# --- Генерация картинки через Hugging Face ---
 async def generate_image(prompt: str):
-    """Генерирует картинку через бесплатный API Pollinations.ai (без токена)"""
+    if not HF_TOKEN:
+        logger.warning("HF_TOKEN не найден")
+        return None
     
-    encoded_prompt = prompt.replace(" ", "%20")
-    # Используем разные модели для лучшего результата
-    url = f"https://pollinations.ai/p/{encoded_prompt}?width=512&height=512&seed=42&nologo=true"
+    API_URL = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-dev"
+    headers = {
+        "Authorization": f"Bearer {HF_TOKEN}",
+        "Content-Type": "application/json"
+    }
     
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as response:
+    async with aiohttp.ClientSession() as session:
+        try:
+            payload = {
+                "inputs": prompt,
+                "parameters": {
+                    "width": 512,
+                    "height": 512,
+                    "num_inference_steps": 4
+                }
+            }
+            
+            async with session.post(
+                API_URL,
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=120)
+            ) as response:
                 if response.status == 200:
                     return await response.read()
                 else:
-                    logger.error(f"Pollinations ошибка: {response.status}")
+                    logger.error(f"HF ошибка: {response.status}")
                     return None
-    except Exception as e:
-        logger.error(f"Ошибка генерации: {e}")
-        return None
+        except Exception as e:
+            logger.error(f"Ошибка генерации: {e}")
+            return None
 
-# --- Распознавание фото ---
+# --- Распознавание фото через NVIDIA VL модель ---
 async def analyze_photo(image_bytes: bytes) -> str:
     image_base64 = base64.b64encode(image_bytes).decode('utf-8')
     
@@ -227,19 +245,27 @@ async def handle_callback(callback: CallbackQuery):
             "• **Чат** — просто напиши текст\n"
             "• **Распознать фото** — отправь картинку\n"
             "• **Сгенерировать картинку** — напиши 'нарисуй ...'\n"
-            "• **Очистить историю** — бот забудет предыдущие сообщения"
+            "• **Очистить историю** — бот забудет прошлые сообщения\n\n"
+            "🔹 **Модели:**\n"
+            "- Чат: NVIDIA Nemotron 3 Super (120B)\n"
+            "- Распознавание: NVIDIA Nemotron Nano 2 VL\n"
+            "- Генерация: FLUX.1-dev (Hugging Face)"
         )
     await callback.answer()
 
 # Генерация картинки
 @dp.message(lambda msg: msg.text and msg.text.lower().startswith("нарисуй"))
 async def handle_generate(message: types.Message):
+    if not HF_TOKEN:
+        await message.answer("❌ Генерация картинок недоступна. Добавьте HF_TOKEN в Render.")
+        return
+    
     prompt = message.text.replace("нарисуй", "").strip()
     if not prompt:
         await message.answer("🎨 Напиши, что нарисовать после слова 'нарисуй'.\nНапример: `нарисуй закат на море`")
         return
     
-    status_msg = await message.answer(f"🎨 Генерирую: *{prompt}*...\n\n⏳ Обычно 10-20 секунд.", parse_mode="Markdown")
+    status_msg = await message.answer(f"🎨 Генерирую: *{prompt}*...\n\n⏳ Обычно 15-30 секунд.", parse_mode="Markdown")
     
     image_data = await generate_image(prompt)
     
@@ -250,7 +276,7 @@ async def handle_generate(message: types.Message):
         photo_file = BufferedInputFile(image_data, filename="image.png")
         await message.answer_photo(photo=photo_file, caption=f"🖼 *{prompt}*", parse_mode="Markdown")
     else:
-        await message.answer("❌ Не удалось сгенерировать картинку. Попробуйте другой запрос.\n\n💡 Совет: напишите подробнее, например 'нарисуй рыжего кота в космосе'")
+        await message.answer("❌ Не удалось сгенерировать картинку. Попробуйте другой запрос.")
 
 @dp.message(lambda msg: msg.photo is not None)
 async def handle_photo(message: types.Message):
@@ -286,7 +312,11 @@ async def handle_message(message: types.Message):
     await message.answer(response)
 
 async def main():
-    logger.info("Бот запущен с исправленными моделями и генерацией картинок!")
+    logger.info("Бот запущен с новыми моделями (Nemotron 3 Super + Nemotron Nano 2 VL)!")
+    if HF_TOKEN:
+        logger.info("HF_TOKEN найден, генерация картинок доступна")
+    else:
+        logger.warning("HF_TOKEN не найден, генерация картинок недоступна")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
