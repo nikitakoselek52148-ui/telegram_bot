@@ -45,7 +45,7 @@ user_histories = {}
 
 # Модели
 VISION_MODEL = "nvidia/nemotron-nano-12b-v2-vl:free"
-TEXT_MODEL = "openrouter/free"
+TEXT_MODEL = "nvidia/gpt-oss-120b:free"
 IMAGE_MODEL = "google/gemini-3.1-flash-image-preview:free"  # Бесплатная модель для генерации картинок
 
 # --- Клавиатура с кнопками ---
