@@ -41,7 +41,7 @@ dp = Dispatcher()
 
 user_histories = {}
 
-# Используем стабильные модели
+# Модели
 TEXT_MODEL = "nvidia/gpt-oss-120b:free"
 VISION_MODEL = "google/gemma-3-27b-it:free"
 
@@ -53,7 +53,10 @@ def get_main_keyboard():
             InlineKeyboardButton(text="📸 Распознать фото", callback_data="photo")
         ],
         [
-            InlineKeyboardButton(text="🗑 Очистить историю", callback_data="clear"),
+            InlineKeyboardButton(text="🎨 Сгенерировать картинку", callback_data="generate"),
+            InlineKeyboardButton(text="🗑 Очистить историю", callback_data="clear")
+        ],
+        [
             InlineKeyboardButton(text="❓ Помощь", callback_data="help")
         ]
     ])
@@ -107,6 +110,33 @@ async def get_ai_response(user_id: int, user_message: str) -> str:
         except Exception as e:
             logger.error(f"Ошибка: {e}")
             return f"❌ Ошибка: {e}"
+
+# --- Генерация картинки через Pollinations.ai (бесплатно!) ---
+async def generate_image(prompt: str) -> str:
+    """Генерирует картинку через Pollinations.ai - бесплатно, без ключа"""
+    
+    # Кодируем prompt для URL
+    encoded_prompt = prompt.replace(" ", "%20")
+    
+    # Pollinations API (бесплатный, без регистрации)
+    # Разные модели на выбор:
+    # flux, turbo, flux-realism, any-dark, realvis, dreamshaper
+    
+    url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?model=flux&width=1024&height=1024&nologo=true"
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as response:
+                if response.status == 200:
+                    # Сохраняем картинку в память
+                    image_data = await response.read()
+                    return image_data
+                else:
+                    logger.error(f"Pollinations ошибка: {response.status}")
+                    return None
+    except Exception as e:
+        logger.error(f"Ошибка генерации: {e}")
+        return None
 
 # --- Распознавание фото ---
 async def analyze_photo(image_bytes: bytes) -> str:
@@ -164,7 +194,8 @@ async def start_command(message: types.Message):
         "🤖 **Привет! Я бот с искусственным интеллектом!**\n\n"
         "Вот что я умею:\n"
         "• 💬 **Общаться** — просто напиши мне сообщение\n"
-        "• 📸 **Распознавать текст с фото** — отправь картинку\n\n"
+        "• 📸 **Распознавать текст с фото** — отправь картинку\n"
+        "• 🎨 **Генерировать картинки** — напиши 'нарисуй ...'\n\n"
         "👇 **Используй кнопки ниже**",
         reply_markup=get_main_keyboard(),
         parse_mode="Markdown"
@@ -185,6 +216,14 @@ async def handle_callback(callback: CallbackQuery):
         await callback.message.answer("💬 Просто напиши мне любое сообщение, и я отвечу!")
     elif callback.data == "photo":
         await callback.message.answer("📸 Отправь мне фото с текстом, и я распознаю его!")
+    elif callback.data == "generate":
+        await callback.message.answer(
+            "🎨 **Что нарисовать?**\n\n"
+            "Напиши в одном сообщении:\n"
+            "`нарисуй кота в космосе`\n\n"
+            "Доступные стили: реализм, аниме, фэнтези и другие.",
+            parse_mode="Markdown"
+        )
     elif callback.data == "clear":
         if user_id in user_histories:
             user_histories[user_id] = [user_histories[user_id][0]]
@@ -194,13 +233,39 @@ async def handle_callback(callback: CallbackQuery):
             "📖 **Помощь**\n\n"
             "• **Чат** — просто напиши текст\n"
             "• **Распознать фото** — отправь картинку\n"
+            "• **Сгенерировать картинку** — напиши 'нарисуй ...'\n"
             "• **Очистить историю** — бот забудет предыдущие сообщения\n\n"
             "🔹 **Примеры запросов:**\n"
+            "- `нарисуй закат на море`\n"
             "- `Что такое ИИ?`\n"
             "- Отправь фото чека\n"
-            "- `Расскажи шутку`"
+            "- `нарисуй кота в шляпе`\n\n"
+            "🎨 **Стили генерации:**\n"
+            "Добавьте в конец запроса: стиль аниме, реализм, фэнтези"
         )
     await callback.answer()
+
+# Генерация картинки
+@dp.message(lambda msg: msg.text and msg.text.lower().startswith("нарисуй"))
+async def handle_generate(message: types.Message):
+    prompt = message.text.replace("нарисуй", "").strip()
+    if not prompt:
+        await message.answer("🎨 Напиши, что нарисовать после слова 'нарисуй'.\nНапример: `нарисуй закат на море`")
+        return
+    
+    status_msg = await message.answer(f"🎨 Генерирую: *{prompt}*...\n\n⏳ Обычно 10-20 секунд.", parse_mode="Markdown")
+    
+    image_data = await generate_image(prompt)
+    
+    await status_msg.delete()
+    
+    if image_data:
+        # Отправляем картинку
+        from aiogram.types import BufferedInputFile
+        photo_file = BufferedInputFile(image_data, filename="image.png")
+        await message.answer_photo(photo=photo_file, caption=f"🖼 *{prompt}*", parse_mode="Markdown")
+    else:
+        await message.answer("❌ Не удалось сгенерировать картинку. Попробуйте другой запрос.\n\nВозможные причины: слишком длинный запрос или временные проблемы сервиса.")
 
 @dp.message(lambda msg: msg.photo is not None)
 async def handle_photo(message: types.Message):
@@ -236,7 +301,7 @@ async def handle_message(message: types.Message):
     await message.answer(response)
 
 async def main():
-    logger.info("Бот запущен!")
+    logger.info("Бот запущен с генерацией картинок через Pollinations.ai!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
