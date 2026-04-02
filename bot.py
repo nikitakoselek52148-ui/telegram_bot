@@ -4,6 +4,8 @@ import logging
 import sqlite3
 import threading
 import json
+import io
+import pandas as pd
 from datetime import datetime
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
@@ -300,6 +302,55 @@ def is_in_wishlist(user_id: int, product_id: int):
     conn.close()
     return result is not None
 
+# --- Импорт из Excel ---
+async def import_products_from_excel(file_bytes: bytes) -> tuple:
+    """
+    Импортирует товары из Excel файла (ДОБАВЛЯЕТ к существующим, не удаляя старые)
+    Возвращает (количество_добавленных, список_ошибок)
+    """
+    try:
+        df = pd.read_excel(io.BytesIO(file_bytes))
+        
+        required_columns = ['name', 'price', 'description']
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        
+        if missing_columns:
+            return 0, [f"Отсутствуют колонки: {', '.join(missing_columns)}"]
+        
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        added = 0
+        errors = []
+        
+        for index, row in df.iterrows():
+            try:
+                name = str(row['name']).strip()
+                price = int(float(row['price']))
+                description = str(row['description']).strip()
+                
+                if not name or price <= 0:
+                    errors.append(f"Строка {index + 2}: неверные данные (name='{name}', price={price})")
+                    continue
+                
+                # ДОБАВЛЯЕМ, а не заменяем
+                cursor.execute(
+                    "INSERT INTO products (name, price, description) VALUES (?, ?, ?)",
+                    (name, price, description)
+                )
+                added += 1
+                
+            except Exception as e:
+                errors.append(f"Строка {index + 2}: {str(e)}")
+        
+        conn.commit()
+        conn.close()
+        
+        return added, errors
+        
+    except Exception as e:
+        return 0, [f"Ошибка чтения файла: {str(e)}"]
+
 # --- Клавиатуры ---
 
 def main_menu_keyboard(is_admin: bool = False):
@@ -330,10 +381,13 @@ def admin_panel_keyboard():
         ],
         [
             InlineKeyboardButton(text="📋 Товары", callback_data="admin_products"),
-            InlineKeyboardButton(text="📦 Заказы", callback_data="admin_orders")
+            InlineKeyboardButton(text="📥 Импорт из Excel", callback_data="admin_import_excel")
         ],
         [
-            InlineKeyboardButton(text="🔄 Статусы заказов", callback_data="admin_update_status"),
+            InlineKeyboardButton(text="📦 Заказы", callback_data="admin_orders"),
+            InlineKeyboardButton(text="🔄 Статусы заказов", callback_data="admin_update_status")
+        ],
+        [
             InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")
         ]
     ])
@@ -414,22 +468,15 @@ async def show_cart(callback: CallbackQuery, user_id: int):
     
     total = 0
     text = "🛒 **Ваша корзина**\n\n"
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[])
     
     for item in cart:
         subtotal = item[2] * item[3]
         total += subtotal
         text += f"• {item[1]} x{item[3]} = {subtotal} ₽\n"
-        keyboard.inline_keyboard.append([
-            InlineKeyboardButton(text=f"➖ {item[1]} ➕", callback_data=f"cart_item_{item[0]}")
-        ])
     
     text += f"\n**Итого: {total} ₽**"
-    keyboard.inline_keyboard.append([InlineKeyboardButton(text="✅ Оформить заказ", callback_data="checkout")])
-    keyboard.inline_keyboard.append([InlineKeyboardButton(text="🗑 Очистить корзину", callback_data="clear_cart")])
-    keyboard.inline_keyboard.append([InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_to_main")])
     
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.message.edit_text(text, reply_markup=cart_keyboard(), parse_mode="Markdown")
 
 # --- Обработчики ---
 
@@ -706,13 +753,33 @@ async def handle_callback(callback: CallbackQuery):
         )
         dp.waiting_for_order_id = getattr(dp, "waiting_for_order_id", set())
         dp.waiting_for_order_id.add(user_id)
+    
+    # --- ИМПОРТ ИЗ EXCEL ---
+    elif data == "admin_import_excel" and is_admin:
+        await callback.message.edit_text(
+            "📥 **Импорт товаров из Excel**\n\n"
+            "Отправьте Excel файл (.xlsx) со следующими колонками:\n\n"
+            "| Колонка | Описание | Пример |\n"
+            "|---------|----------|--------|\n"
+            "| name | Название товара | Кроссовки Nike |\n"
+            "| price | Цена (число) | 8900 |\n"
+            "| description | Описание | Спортивные кроссовки |\n\n"
+            "📌 **Важно:** Первая строка файла должна содержать названия колонок!\n\n"
+            "✅ Товары **добавятся** к существующим (старые останутся)\n\n"
+            "📎 Отправьте файл в этот чат:",
+            reply_markup=admin_panel_keyboard(),
+            parse_mode="Markdown"
+        )
+        dp.waiting_for_excel = getattr(dp, "waiting_for_excel", set())
+        dp.waiting_for_excel.add(user_id)
 
-# --- Обработка добавления товара ---
+# --- Обработка ввода ---
 @dp.message()
 async def handle_input(message: types.Message):
     user_id = message.from_user.id
     is_admin = user_id in ADMIN_IDS
     
+    # Добавление товара вручную
     if hasattr(dp, "awaiting_product") and user_id in dp.awaiting_product:
         dp.awaiting_product.remove(user_id)
         
@@ -735,6 +802,7 @@ async def handle_input(message: types.Message):
         await message.answer("🛍 Вернуться в меню:", reply_markup=main_menu_keyboard(is_admin))
         return
     
+    # Изменение статуса заказа по номеру
     if hasattr(dp, "waiting_for_order_id") and user_id in dp.waiting_for_order_id:
         dp.waiting_for_order_id.remove(user_id)
         try:
@@ -754,7 +822,60 @@ async def handle_input(message: types.Message):
             await message.answer("❌ Введите номер заказа (цифрами)")
         return
     
+    # Обычное сообщение
     await message.answer("🛍 Используйте кнопки для навигации.", reply_markup=main_menu_keyboard(is_admin))
+
+# --- Обработчик Excel файлов (импорт) ---
+@dp.message(lambda msg: msg.document and msg.document.file_name and msg.document.file_name.endswith(('.xlsx', '.xls')))
+async def handle_excel_import(message: types.Message):
+    user_id = message.from_user.id
+    is_admin = user_id in ADMIN_IDS
+    
+    # Проверяем, ждём ли мы файл
+    if not hasattr(dp, "waiting_for_excel") or user_id not in dp.waiting_for_excel:
+        # Если не ждём, но файл пришёл — игнорируем
+        return
+    
+    dp.waiting_for_excel.remove(user_id)
+    
+    if not is_admin:
+        await message.answer("❌ У вас нет прав на импорт товаров")
+        return
+    
+    status_msg = await message.answer("📥 Загружаю файл...")
+    
+    try:
+        # Скачиваем файл
+        file = await bot.get_file(message.document.file_id)
+        file_bytes = io.BytesIO()
+        await bot.download_file(file.file_path, destination=file_bytes)
+        file_bytes.seek(0)
+        
+        await status_msg.edit_text("📊 Обрабатываю файл...")
+        
+        # Импортируем товары
+        added, errors = await import_products_from_excel(file_bytes.getvalue())
+        
+        # Отправляем результат
+        result_text = f"✅ **Импорт завершён!**\n\n"
+        result_text += f"📦 Добавлено товаров: {added}\n"
+        
+        if errors:
+            result_text += f"\n⚠️ **Ошибки ({len(errors)}):**\n"
+            for err in errors[:5]:
+                result_text += f"• {err}\n"
+            if len(errors) > 5:
+                result_text += f"• ... и ещё {len(errors) - 5} ошибок\n"
+        
+        await status_msg.delete()
+        await message.answer(result_text, parse_mode="Markdown")
+        
+        # Показываем кнопку возврата в админку
+        await message.answer("🔐 Вернуться в админ-панель:", reply_markup=admin_panel_keyboard())
+        
+    except Exception as e:
+        await status_msg.delete()
+        await message.answer(f"❌ Ошибка при импорте: {str(e)}")
 
 # --- Запуск ---
 async def main():
@@ -763,6 +884,7 @@ async def main():
     logger.info("🛍 БОТ-МАГАЗИН ЗАПУЩЕН")
     logger.info(f"🤖 Бот: @{(await bot.get_me()).username}")
     logger.info(f"👑 Администратор: {ADMIN_IDS}")
+    logger.info(f"📥 Импорт из Excel: ДОБАВЛЯЕТ товары к существующим")
     logger.info("=" * 40)
     await dp.start_polling(bot)
 
