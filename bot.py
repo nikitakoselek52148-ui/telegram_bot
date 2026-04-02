@@ -21,36 +21,32 @@ if not BOT_TOKEN or not OPENROUTER_API_KEY:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-user_histories = {}
-
-# Мультимодальная модель для распознавания текста с фото
-VISION_MODEL = "google/gemini-2.5-flash-lite-preview-03-25:free"
-# Обычная модель для чата
-TEXT_MODEL = "openrouter/free"
-
-# --- Веб-сервер для Render (чтобы не убивал процесс) ---
+# --- Веб-сервер для Render ---
 web_app = Flask(__name__)
 
 @web_app.route('/')
 def health_check():
     return "Bot is running!", 200
 
-@web_app.route('/health')
-def health():
-    return "OK", 200
-
 def run_web_server():
     web_app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
 
-# Запускаем веб-сервер в отдельном потоке
 web_thread = threading.Thread(target=run_web_server, daemon=True)
 web_thread.start()
 logger.info("Веб-сервер для Render запущен на порту 10000")
 
-# --- Основная логика бота ---
+# --- Создаём бота и диспетчер ---
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+# Хранилище истории диалогов
+user_histories = {}
+
+# Модели
+VISION_MODEL = "google/gemini-2.5-flash-lite-preview-03-25:free"
+TEXT_MODEL = "openrouter/free"
 
 async def get_ai_response(user_id: int, user_message: str) -> str:
-    """Обычный чат с текстом"""
     if user_id not in user_histories:
         user_histories[user_id] = [
             {"role": "system", "content": "Ты полезный AI-ассистент. Отвечай на русском языке кратко и по делу."}
@@ -99,8 +95,6 @@ async def get_ai_response(user_id: int, user_message: str) -> str:
             return f"❌ Ошибка: {e}"
 
 async def analyze_photo_with_vision(image_bytes: bytes, user_question: str = None) -> str:
-    """Отправляет фото в мультимодальную модель для анализа"""
-    
     image_base64 = base64.b64encode(image_bytes).decode('utf-8')
     
     if user_question:
@@ -152,8 +146,6 @@ async def analyze_photo_with_vision(image_bytes: bytes, user_question: str = Non
             logger.error(f"Vision ошибка: {e}")
             return None
 
-# --- Обработчики сообщений ---
-
 @dp.message(Command("start"))
 async def start_command(message: types.Message):
     await message.answer(
@@ -176,7 +168,6 @@ async def clear_history(message: types.Message):
         user_histories[user_id] = [user_histories[user_id][0]]
     await message.answer("🧹 История диалога очищена!")
 
-# Обработчик фотографий
 @dp.message(lambda msg: msg.photo is not None)
 async def handle_photo(message: types.Message):
     user_id = message.from_user.id
@@ -208,7 +199,6 @@ async def handle_photo(message: types.Message):
     else:
         await message.answer("❌ Не удалось распознать текст на фото. Попробуйте сделать фото чётче или используйте другое освещение.")
 
-# Обработчик текстовых сообщений
 @dp.message()
 async def handle_message(message: types.Message):
     user_id = message.from_user.id
@@ -218,7 +208,6 @@ async def handle_message(message: types.Message):
     response = await get_ai_response(user_id, user_text)
     await message.answer(response)
 
-# Запуск бота
 async def main():
     logger.info("Бот запущен с поддержкой фото и веб-сервером для Render!")
     await dp.start_polling(bot)
