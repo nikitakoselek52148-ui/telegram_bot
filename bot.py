@@ -7,6 +7,7 @@ import threading
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 import aiohttp
 from flask import Flask
 
@@ -16,7 +17,7 @@ BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 if not BOT_TOKEN or not OPENROUTER_API_KEY:
-    raise ValueError("Токены не найдены! Проверьте файл .env")
+    raise ValueError("Токены не найдены!")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -33,9 +34,9 @@ def run_web_server():
 
 web_thread = threading.Thread(target=run_web_server, daemon=True)
 web_thread.start()
-logger.info("Веб-сервер для Render запущен на порту 10000")
+logger.info("Веб-сервер запущен")
 
-# --- Создаём бота и диспетчер ---
+# --- Бот ---
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
@@ -45,7 +46,26 @@ user_histories = {}
 # Модели
 VISION_MODEL = "nvidia/nemotron-nano-12b-v2-vl:free"
 TEXT_MODEL = "openrouter/free"
+IMAGE_MODEL = "flux-schnell:free"  # Бесплатная модель для генерации картинок
 
+# --- Клавиатура с кнопками ---
+def get_main_keyboard():
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="💬 Чат с ИИ", callback_data="chat"),
+            InlineKeyboardButton(text="📸 Распознать фото", callback_data="photo")
+        ],
+        [
+            InlineKeyboardButton(text="🎨 Сгенерировать картинку", callback_data="generate"),
+            InlineKeyboardButton(text="🗑 Очистить историю", callback_data="clear")
+        ],
+        [
+            InlineKeyboardButton(text="❓ Помощь", callback_data="help")
+        ]
+    ])
+    return keyboard
+
+# --- Текстовый чат ---
 async def get_ai_response(user_id: int, user_message: str) -> str:
     if user_id not in user_histories:
         user_histories[user_id] = [
@@ -84,16 +104,54 @@ async def get_ai_response(user_id: int, user_message: str) -> str:
                     user_histories[user_id].append({"role": "assistant", "content": ai_response})
                     return ai_response
                 else:
-                    error_text = await response.text()
-                    logger.error(f"Ошибка API: {response.status} - {error_text}")
                     return f"❌ Ошибка API: {response.status}"
                     
         except asyncio.TimeoutError:
-            return "⏰ Превышено время ожидания. Попробуйте ещё раз."
+            return "⏰ Превышено время ожидания."
         except Exception as e:
-            logger.error(f"Ошибка: {e}")
             return f"❌ Ошибка: {e}"
 
+# --- Генерация картинки ---
+async def generate_image(prompt: str) -> str:
+    """Генерирует картинку через Flux Schnell на OpenRouter"""
+    
+    async with aiohttp.ClientSession() as session:
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        data = {
+            "model": IMAGE_MODEL,
+            "prompt": prompt,
+            "width": 512,
+            "height": 512,
+            "steps": 4
+        }
+        
+        try:
+            async with session.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json=data,
+                timeout=aiohttp.ClientTimeout(total=120)
+            ) as response:
+                
+                if response.status == 200:
+                    result = await response.json()
+                    # Flux возвращает ссылку на картинку
+                    image_url = result["choices"][0]["message"]["content"]
+                    return image_url
+                else:
+                    error_text = await response.text()
+                    logger.error(f"Ошибка генерации: {response.status} - {error_text}")
+                    return None
+                    
+        except Exception as e:
+            logger.error(f"Ошибка: {e}")
+            return None
+
+# --- Распознавание фото ---
 async def analyze_photo_with_vision(image_bytes: bytes, user_question: str = None) -> str:
     image_base64 = base64.b64encode(image_bytes).decode('utf-8')
     
@@ -138,36 +196,93 @@ async def analyze_photo_with_vision(image_bytes: bytes, user_question: str = Non
                     result = await response.json()
                     return result["choices"][0]["message"]["content"]
                 else:
-                    error_text = await response.text()
-                    logger.error(f"Vision API ошибка: {response.status} - {error_text}")
                     return None
                     
         except Exception as e:
             logger.error(f"Vision ошибка: {e}")
             return None
 
+# --- Обработчики команд и кнопок ---
+
 @dp.message(Command("start"))
 async def start_command(message: types.Message):
     await message.answer(
-        "🤖 Привет! Я бот с доступом к нейросетям через OpenRouter.\n\n"
-        "📝 **Что я умею:**\n"
-        "• Отвечать на текстовые сообщения\n"
-        "• 📸 Распознавать текст с фотографий\n"
-        "• Отвечать на вопросы по фото\n\n"
-        "**Как пользоваться:**\n"
-        "• Просто напиши текст — я отвечу\n"
-        "• Отправь фото — я распознаю текст\n"
-        "• Отправь фото с вопросом в подписи — отвечу по фото\n\n"
-        "/clear — очистить историю диалога"
+        "🤖 **Привет! Я бот с искусственным интеллектом!**\n\n"
+        "Вот что я умею:\n"
+        "• 💬 **Общаться** — просто напиши мне сообщение\n"
+        "• 📸 **Распознавать текст с фото** — отправь картинку\n"
+        "• 🎨 **Генерировать картинки** — напиши 'нарисуй ...'\n\n"
+        "👇 **Используй кнопки ниже для удобства**",
+        reply_markup=get_main_keyboard(),
+        parse_mode="Markdown"
     )
 
 @dp.message(Command("clear"))
-async def clear_history(message: types.Message):
+async def clear_history_command(message: types.Message):
     user_id = message.from_user.id
     if user_id in user_histories:
         user_histories[user_id] = [user_histories[user_id][0]]
     await message.answer("🧹 История диалога очищена!")
 
+# Обработка нажатий на кнопки
+@dp.callback_query()
+async def handle_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    
+    if callback.data == "chat":
+        await callback.message.answer("💬 Просто напиши мне любое сообщение, и я отвечу!")
+    
+    elif callback.data == "photo":
+        await callback.message.answer("📸 Отправь мне фото с текстом, и я распознаю его!")
+    
+    elif callback.data == "generate":
+        await callback.message.answer(
+            "🎨 **Что нарисовать?**\n\n"
+            "Напиши в одном сообщении:\n"
+            "`нарисуй кота в космосе`\n\n"
+            "Или просто нажми на кнопку и напиши свой запрос.",
+            parse_mode="Markdown"
+        )
+    
+    elif callback.data == "clear":
+        if user_id in user_histories:
+            user_histories[user_id] = [user_histories[user_id][0]]
+        await callback.message.answer("🧹 История диалога очищена!")
+    
+    elif callback.data == "help":
+        await callback.message.answer(
+            "📖 **Помощь**\n\n"
+            "• **Чат** — просто напиши текст\n"
+            "• **Распознать фото** — отправь картинку\n"
+            "• **Сгенерировать картинку** — напиши 'нарисуй ...'\n"
+            "• **Очистить историю** — бот забудет предыдущие сообщения\n\n"
+            "🔹 **Примеры запросов:**\n"
+            "- `нарисуй закат на море`\n"
+            "- `Что такое ИИ?`\n"
+            "- Отправь фото чека\n"
+            "- `нарисуй кота в шляпе`"
+        )
+    
+    await callback.answer()
+
+# Генерация картинки по тексту
+@dp.message(lambda msg: msg.text and msg.text.lower().startswith("нарисуй"))
+async def handle_generate(message: types.Message):
+    prompt = message.text.replace("нарисуй", "").strip()
+    if not prompt:
+        await message.answer("🎨 Напиши, что нарисовать после слова 'нарисуй'.\nНапример: `нарисуй закат на море`")
+        return
+    
+    await message.answer(f"🎨 Генерирую: *{prompt}*...\n\n⏳ Обычно это занимает 10-20 секунд.", parse_mode="Markdown")
+    
+    image_url = await generate_image(prompt)
+    
+    if image_url:
+        await message.answer_photo(photo=image_url, caption=f"🖼 *{prompt}*", parse_mode="Markdown")
+    else:
+        await message.answer("❌ Не удалось сгенерировать картинку. Попробуйте другой запрос или повторите позже.")
+
+# Обработка фото
 @dp.message(lambda msg: msg.photo is not None)
 async def handle_photo(message: types.Message):
     user_id = message.from_user.id
@@ -193,12 +308,13 @@ async def handle_photo(message: types.Message):
             result = result[:4000] + "\n\n...(текст обрезан)"
         
         if user_question:
-            await message.answer(f"📸 **Ответ по фото:**\n\n{result}")
+            await message.answer(f"📸 **Ответ по фото:**\n\n{result}", parse_mode="Markdown")
         else:
-            await message.answer(f"📝 **Распознанный текст:**\n\n{result}")
+            await message.answer(f"📝 **Распознанный текст:**\n\n{result}", parse_mode="Markdown")
     else:
-        await message.answer("❌ Не удалось распознать текст на фото. Попробуйте сделать фото чётче или используйте другое освещение.")
+        await message.answer("❌ Не удалось распознать текст на фото. Попробуйте сделать фото чётче.")
 
+# Обработка текстовых сообщений (обычный чат)
 @dp.message()
 async def handle_message(message: types.Message):
     user_id = message.from_user.id
@@ -208,8 +324,9 @@ async def handle_message(message: types.Message):
     response = await get_ai_response(user_id, user_text)
     await message.answer(response)
 
+# Запуск
 async def main():
-    logger.info("Бот запущен с поддержкой фото и веб-сервером для Render!")
+    logger.info("Бот запущен с кнопками и генерацией картинок!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
