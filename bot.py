@@ -4,7 +4,6 @@ import logging
 import base64
 import io
 import threading
-import json
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -35,19 +34,16 @@ def run_web_server():
 
 web_thread = threading.Thread(target=run_web_server, daemon=True)
 web_thread.start()
-logger.info("Веб-сервер запущен")
 
 # --- Бот ---
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Хранилище истории диалогов
 user_histories = {}
 
-# Модели
-TEXT_MODEL = "nvidia/gpt-oss-120b:free"  # Стабильная бесплатная модель для чата
-VISION_MODEL = "google/gemma-3-27b-it:free"  # Для распознавания фото
-IMAGE_MODEL = "google/gemini-2.5-flash-image-preview:free"  # Для генерации картинок
+# Используем стабильные модели
+TEXT_MODEL = "nvidia/gpt-oss-120b:free"
+VISION_MODEL = "google/gemma-3-27b-it:free"
 
 # --- Клавиатура ---
 def get_main_keyboard():
@@ -57,10 +53,7 @@ def get_main_keyboard():
             InlineKeyboardButton(text="📸 Распознать фото", callback_data="photo")
         ],
         [
-            InlineKeyboardButton(text="🎨 Сгенерировать картинку", callback_data="generate"),
-            InlineKeyboardButton(text="🗑 Очистить историю", callback_data="clear")
-        ],
-        [
+            InlineKeyboardButton(text="🗑 Очистить историю", callback_data="clear"),
             InlineKeyboardButton(text="❓ Помощь", callback_data="help")
         ]
     ])
@@ -110,83 +103,16 @@ async def get_ai_response(user_id: int, user_message: str) -> str:
                     return f"❌ Ошибка API: {response.status}"
                     
         except asyncio.TimeoutError:
-            return "⏰ Превышено время ожидания."
-        except Exception as e:
-            return f"❌ Ошибка: {e}"
-
-# --- Генерация картинки (исправлено!) ---
-async def generate_image(prompt: str) -> str:
-    """Генерирует картинку через Gemini Flash Image на OpenRouter"""
-    
-    async with aiohttp.ClientSession() as session:
-        headers = {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        
-        # ВАЖНО: Для генерации картинок нужно передать modalities и правильный формат
-        data = {
-            "model": IMAGE_MODEL,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            "modalities": ["image", "text"]  # Ключевой параметр для получения картинки! [citation:1][citation:4]
-        }
-        
-        try:
-            async with session.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers=headers,
-                json=data,
-                timeout=aiohttp.ClientTimeout(total=120)
-            ) as response:
-                
-                logger.info(f"Статус генерации: {response.status}")
-                
-                if response.status == 200:
-                    result = await response.json()
-                    logger.info(f"Ответ генерации: {json.dumps(result, indent=2)[:500]}")
-                    
-                    # Gemini возвращает изображение в message.images
-                    if "choices" in result and len(result["choices"]) > 0:
-                        message = result["choices"][0].get("message", {})
-                        
-                        # Проверяем наличие images в ответе
-                        if "images" in message and message["images"]:
-                            image_url = message["images"][0].get("url")
-                            if image_url:
-                                return image_url
-                        
-                        # Если нет images, пробуем извлечь URL из текста
-                        if "content" in message and message["content"]:
-                            content = message["content"]
-                            import re
-                            # Ищем ссылку на изображение
-                            url_match = re.search(r'https?://[^\s]+\.(?:jpg|jpeg|png|gif|webp)', content)
-                            if url_match:
-                                return url_match.group(0)
-                    
-                    return None
-                else:
-                    error_text = await response.text()
-                    logger.error(f"Ошибка генерации: {response.status} - {error_text}")
-                    return None
-                    
+            return "⏰ Превышено время ожидания. Попробуйте ещё раз."
         except Exception as e:
             logger.error(f"Ошибка: {e}")
-            return None
+            return f"❌ Ошибка: {e}"
 
 # --- Распознавание фото ---
-async def analyze_photo_with_vision(image_bytes: bytes, user_question: str = None) -> str:
+async def analyze_photo(image_bytes: bytes) -> str:
     image_base64 = base64.b64encode(image_bytes).decode('utf-8')
     
-    if user_question:
-        prompt = f"Посмотри на это фото и ответь на вопрос: {user_question}"
-    else:
-        prompt = "Извлеки и распознай весь текст с этого фото. Напиши только распознанный текст, без лишних комментариев."
+    prompt = "Извлеки и распознай весь текст с этого фото. Напиши только распознанный текст, без лишних комментариев."
     
     async with aiohttp.ClientSession() as session:
         headers = {
@@ -208,8 +134,7 @@ async def analyze_photo_with_vision(image_bytes: bytes, user_question: str = Non
                     ]
                 }
             ],
-            "max_tokens": 2000,
-            "temperature": 0.3
+            "max_tokens": 1000
         }
         
         try:
@@ -217,13 +142,14 @@ async def analyze_photo_with_vision(image_bytes: bytes, user_question: str = Non
                 "https://openrouter.ai/api/v1/chat/completions",
                 headers=headers,
                 json=data,
-                timeout=aiohttp.ClientTimeout(total=90)
+                timeout=aiohttp.ClientTimeout(total=60)
             ) as response:
                 
                 if response.status == 200:
                     result = await response.json()
                     return result["choices"][0]["message"]["content"]
                 else:
+                    logger.error(f"Vision ошибка: {response.status}")
                     return None
                     
         except Exception as e:
@@ -238,9 +164,8 @@ async def start_command(message: types.Message):
         "🤖 **Привет! Я бот с искусственным интеллектом!**\n\n"
         "Вот что я умею:\n"
         "• 💬 **Общаться** — просто напиши мне сообщение\n"
-        "• 📸 **Распознавать текст с фото** — отправь картинку\n"
-        "• 🎨 **Генерировать картинки** — напиши 'нарисуй ...'\n\n"
-        "👇 **Используй кнопки ниже для удобства**",
+        "• 📸 **Распознавать текст с фото** — отправь картинку\n\n"
+        "👇 **Используй кнопки ниже**",
         reply_markup=get_main_keyboard(),
         parse_mode="Markdown"
     )
@@ -260,14 +185,6 @@ async def handle_callback(callback: CallbackQuery):
         await callback.message.answer("💬 Просто напиши мне любое сообщение, и я отвечу!")
     elif callback.data == "photo":
         await callback.message.answer("📸 Отправь мне фото с текстом, и я распознаю его!")
-    elif callback.data == "generate":
-        await callback.message.answer(
-            "🎨 **Что нарисовать?**\n\n"
-            "Напиши в одном сообщении:\n"
-            "`нарисуй кота в космосе`\n\n"
-            "Или просто нажми на кнопку и напиши свой запрос.",
-            parse_mode="Markdown"
-        )
     elif callback.data == "clear":
         if user_id in user_histories:
             user_histories[user_id] = [user_histories[user_id][0]]
@@ -277,40 +194,19 @@ async def handle_callback(callback: CallbackQuery):
             "📖 **Помощь**\n\n"
             "• **Чат** — просто напиши текст\n"
             "• **Распознать фото** — отправь картинку\n"
-            "• **Сгенерировать картинку** — напиши 'нарисуй ...'\n"
             "• **Очистить историю** — бот забудет предыдущие сообщения\n\n"
             "🔹 **Примеры запросов:**\n"
-            "- `нарисуй закат на море`\n"
             "- `Что такое ИИ?`\n"
             "- Отправь фото чека\n"
-            "- `нарисуй кота в шляпе`"
+            "- `Расскажи шутку`"
         )
     await callback.answer()
 
-@dp.message(lambda msg: msg.text and msg.text.lower().startswith("нарисуй"))
-async def handle_generate(message: types.Message):
-    prompt = message.text.replace("нарисуй", "").strip()
-    if not prompt:
-        await message.answer("🎨 Напиши, что нарисовать после слова 'нарисуй'.\nНапример: `нарисуй закат на море`")
-        return
-    
-    await message.answer(f"🎨 Генерирую: *{prompt}*...\n\n⏳ Обычно это занимает 10-20 секунд.", parse_mode="Markdown")
-    
-    image_url = await generate_image(prompt)
-    
-    if image_url:
-        await message.answer_photo(photo=image_url, caption=f"🖼 *{prompt}*", parse_mode="Markdown")
-    else:
-        await message.answer("❌ Не удалось сгенерировать картинку. Попробуйте другой запрос.\n\nВозможно, модель временно недоступна или лимит запросов исчерпан.")
-
 @dp.message(lambda msg: msg.photo is not None)
 async def handle_photo(message: types.Message):
-    user_id = message.from_user.id
+    await bot.send_chat_action(message.from_user.id, "typing")
     
-    await bot.send_chat_action(user_id, "typing")
-    user_question = message.caption if message.caption else None
-    
-    status_msg = await message.answer("📷 Получил фото! Анализирую...")
+    status_msg = await message.answer("📷 Получил фото! Распознаю текст...")
     
     photo = message.photo[-1]
     file = await bot.get_file(photo.file_id)
@@ -319,20 +215,16 @@ async def handle_photo(message: types.Message):
     await bot.download_file(file.file_path, destination=photo_bytes)
     photo_bytes.seek(0)
     
-    result = await analyze_photo_with_vision(photo_bytes.getvalue(), user_question)
+    result = await analyze_photo(photo_bytes.getvalue())
     
     await status_msg.delete()
     
     if result:
         if len(result) > 4000:
             result = result[:4000] + "\n\n...(текст обрезан)"
-        
-        if user_question:
-            await message.answer(f"📸 **Ответ по фото:**\n\n{result}", parse_mode="Markdown")
-        else:
-            await message.answer(f"📝 **Распознанный текст:**\n\n{result}", parse_mode="Markdown")
+        await message.answer(f"📝 **Распознанный текст:**\n\n{result}", parse_mode="Markdown")
     else:
-        await message.answer("❌ Не удалось распознать текст на фото. Попробуйте сделать фото чётче.")
+        await message.answer("❌ Не удалось распознать текст. Попробуйте фото с более чётким текстом.")
 
 @dp.message()
 async def handle_message(message: types.Message):
@@ -344,7 +236,7 @@ async def handle_message(message: types.Message):
     await message.answer(response)
 
 async def main():
-    logger.info("Бот запущен с исправленными моделями!")
+    logger.info("Бот запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
