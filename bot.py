@@ -42,8 +42,8 @@ dp = Dispatcher()
 
 user_histories = {}
 
-# Модели
-TEXT_MODEL = "google/gemma-3-12b-it:free"
+# ✅ ИСПРАВЛЕННЫЕ МОДЕЛИ
+TEXT_MODEL = "nvidia/gpt-oss-120b:free"  # Рабочая модель для чата
 VISION_MODEL = "google/gemma-3-27b-it:free"
 
 # --- Клавиатура ---
@@ -112,43 +112,25 @@ async def get_ai_response(user_id: int, user_message: str) -> str:
             logger.error(f"Ошибка: {e}")
             return f"❌ Ошибка: {e}"
 
-# --- Генерация картинки через Hugging Face ---
+# --- Генерация картинки через бесплатный API (без токена) ---
 async def generate_image(prompt: str):
-    """Генерирует картинку через Hugging Face"""
+    """Генерирует картинку через бесплатный API Pollinations.ai (без токена)"""
     
-    API_URL = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-dev"
+    encoded_prompt = prompt.replace(" ", "%20")
+    # Используем разные модели для лучшего результата
+    url = f"https://pollinations.ai/p/{encoded_prompt}?width=512&height=512&seed=42&nologo=true"
     
-    headers = {
-        "Authorization": f"Bearer {HF_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    
-    async with aiohttp.ClientSession() as session:
-        try:
-            payload = {
-                "inputs": prompt,
-                "parameters": {
-                    "width": 512,
-                    "height": 512,
-                    "num_inference_steps": 4
-                }
-            }
-            
-            async with session.post(
-                API_URL,
-                headers=headers,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=120)
-            ) as response:
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as response:
                 if response.status == 200:
                     return await response.read()
                 else:
-                    error_text = await response.text()
-                    logger.error(f"HF ошибка {response.status}: {error_text}")
+                    logger.error(f"Pollinations ошибка: {response.status}")
                     return None
-        except Exception as e:
-            logger.error(f"Ошибка генерации: {e}")
-            return None
+    except Exception as e:
+        logger.error(f"Ошибка генерации: {e}")
+        return None
 
 # --- Распознавание фото ---
 async def analyze_photo(image_bytes: bytes) -> str:
@@ -232,7 +214,8 @@ async def handle_callback(callback: CallbackQuery):
         await callback.message.answer(
             "🎨 **Что нарисовать?**\n\n"
             "Напиши в одном сообщении:\n"
-            "`нарисуй кота в космосе`"
+            "`нарисуй кота в космосе`\n\n"
+            "Примеры: `нарисуй закат на море`, `нарисуй робота`"
         )
     elif callback.data == "clear":
         if user_id in user_histories:
@@ -244,10 +227,7 @@ async def handle_callback(callback: CallbackQuery):
             "• **Чат** — просто напиши текст\n"
             "• **Распознать фото** — отправь картинку\n"
             "• **Сгенерировать картинку** — напиши 'нарисуй ...'\n"
-            "• **Очистить историю** — бот забудет предыдущие сообщения\n\n"
-            "🔹 **Примеры:**\n"
-            "- `нарисуй закат на море`\n"
-            "- `Что такое ИИ?`"
+            "• **Очистить историю** — бот забудет предыдущие сообщения"
         )
     await callback.answer()
 
@@ -259,7 +239,7 @@ async def handle_generate(message: types.Message):
         await message.answer("🎨 Напиши, что нарисовать после слова 'нарисуй'.\nНапример: `нарисуй закат на море`")
         return
     
-    status_msg = await message.answer(f"🎨 Генерирую: *{prompt}*...\n\n⏳ Обычно 15-30 секунд.", parse_mode="Markdown")
+    status_msg = await message.answer(f"🎨 Генерирую: *{prompt}*...\n\n⏳ Обычно 10-20 секунд.", parse_mode="Markdown")
     
     image_data = await generate_image(prompt)
     
@@ -270,7 +250,7 @@ async def handle_generate(message: types.Message):
         photo_file = BufferedInputFile(image_data, filename="image.png")
         await message.answer_photo(photo=photo_file, caption=f"🖼 *{prompt}*", parse_mode="Markdown")
     else:
-        await message.answer("❌ Не удалось сгенерировать картинку. Попробуйте другой запрос.")
+        await message.answer("❌ Не удалось сгенерировать картинку. Попробуйте другой запрос.\n\n💡 Совет: напишите подробнее, например 'нарисуй рыжего кота в космосе'")
 
 @dp.message(lambda msg: msg.photo is not None)
 async def handle_photo(message: types.Message):
@@ -306,7 +286,7 @@ async def handle_message(message: types.Message):
     await message.answer(response)
 
 async def main():
-    logger.info("Бот запущен с Hugging Face генерацией картинок!")
+    logger.info("Бот запущен с исправленными моделями и генерацией картинок!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
