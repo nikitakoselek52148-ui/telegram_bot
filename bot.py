@@ -4,7 +4,6 @@ import logging
 import base64
 import io
 import threading
-import random
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -43,16 +42,20 @@ dp = Dispatcher()
 
 user_histories = {}
 
-# ✅ СПИСОК БЕСПЛАТНЫХ МОДЕЛЕЙ ДЛЯ АВТО-ПЕРЕКЛЮЧЕНИЯ
-FREE_MODELS = [
-    "nvidia/nemotron-3-super-120b-a12b:free",
-    "openrouter/free",  # Автоматический роутер
-    "qwen/qwen3-next-80b-a3b-instruct:free",
-    "mistralai/mistral-small-3.2-24b-instruct:free"
-]
+# ✅ ИСПОЛЬЗУЕМ OPENROUTER/AUTO - САМЫЙ УМНЫЙ ВЫБОР!
+# Модель сама анализирует запрос и выбирает лучшую нейросеть
+TEXT_MODEL = "openrouter/auto"
 
 # Модель для распознавания фото
-VISION_MODEL = "nvidia/nemotron-nano-2-vl:free"
+VISION_MODEL = "nvidia/nemotron-nano-12b-v2-vl:free"
+
+# Резервные модели (на случай если auto недоступен)
+BACKUP_MODELS = [
+    "openrouter/free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "mistralai/mistral-small-3.2-24b-instruct:free"
+]
 
 # --- Клавиатура ---
 def get_main_keyboard():
@@ -72,7 +75,7 @@ def get_main_keyboard():
     ])
     return keyboard
 
-# --- Текстовый чат с авто-переключением моделей ---
+# --- Текстовый чат с openrouter/auto ---
 async def get_ai_response(user_id: int, user_message: str) -> str:
     if user_id not in user_histories:
         user_histories[user_id] = [
@@ -84,8 +87,10 @@ async def get_ai_response(user_id: int, user_message: str) -> str:
     if len(user_histories[user_id]) > 20:
         user_histories[user_id] = [user_histories[user_id][0]] + user_histories[user_id][-19:]
     
-    # Пробуем разные модели при ошибках
-    for model in FREE_MODELS:
+    # Сначала пробуем openrouter/auto
+    models_to_try = [TEXT_MODEL] + BACKUP_MODELS
+    
+    for model in models_to_try:
         try:
             async with aiohttp.ClientSession() as session:
                 headers = {
@@ -104,22 +109,22 @@ async def get_ai_response(user_id: int, user_message: str) -> str:
                     "https://openrouter.ai/api/v1/chat/completions",
                     headers=headers,
                     json=data,
-                    timeout=aiohttp.ClientTimeout(total=60)
+                    timeout=aiohttp.ClientTimeout(total=90)
                 ) as response:
                     
                     if response.status == 200:
                         result = await response.json()
                         ai_response = result["choices"][0]["message"]["content"]
                         user_histories[user_id].append({"role": "assistant", "content": ai_response})
+                        logger.info(f"Успешно использована модель: {model}")
                         return ai_response
                     elif response.status == 429:
-                        # Лимит превышен, пробуем следующую модель
-                        logger.warning(f"Модель {model} вернула 429, пробуем другую...")
-                        await asyncio.sleep(1)  # Небольшая пауза
+                        logger.warning(f"Модель {model} вернула 429 (лимит), пробуем следующую...")
+                        await asyncio.sleep(1)
                         continue
                     else:
                         error_text = await response.text()
-                        logger.error(f"Ошибка API {model}: {response.status} - {error_text}")
+                        logger.error(f"Ошибка {model}: {response.status} - {error_text}")
                         continue
                         
         except asyncio.TimeoutError:
@@ -129,11 +134,12 @@ async def get_ai_response(user_id: int, user_message: str) -> str:
             logger.error(f"Ошибка для модели {model}: {e}")
             continue
     
-    return "❌ Все модели временно недоступны. Попробуйте через минуту."
+    return "❌ Все модели временно недоступны. Попробуйте через минуту.\n\n💡 Совет: Если ошибка повторяется, пополните баланс OpenRouter до $10 для увеличения лимита."
 
 # --- Генерация картинки через Hugging Face ---
 async def generate_image(prompt: str):
     if not HF_TOKEN:
+        logger.warning("HF_TOKEN не найден")
         return None
     
     API_URL = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-dev"
@@ -160,9 +166,11 @@ async def generate_image(prompt: str):
                 timeout=aiohttp.ClientTimeout(total=120)
             ) as response:
                 if response.status == 200:
+                    logger.info("Картинка успешно сгенерирована")
                     return await response.read()
                 else:
-                    logger.error(f"HF ошибка: {response.status}")
+                    error_text = await response.text()
+                    logger.error(f"HF ошибка {response.status}: {error_text}")
                     return None
         except Exception as e:
             logger.error(f"Ошибка генерации: {e}")
@@ -226,7 +234,10 @@ async def start_command(message: types.Message):
         "• 💬 **Общаться** — просто напиши мне сообщение\n"
         "• 📸 **Распознавать текст с фото** — отправь картинку\n"
         "• 🎨 **Генерировать картинки** — напиши 'нарисуй ...'\n\n"
-        "📊 **Важно:** При большой нагрузке ответ может занимать 5-10 секунд.\n\n"
+        "⚡ **Фишки:**\n"
+        "• Использую **openrouter/auto** — сам выбираю лучшую нейросеть\n"
+        "• Автоматически переключаю модели при ошибках\n"
+        "• Поддержка 20+ бесплатных моделей\n\n"
         "👇 **Используй кнопки ниже**",
         reply_markup=get_main_keyboard(),
         parse_mode="Markdown"
@@ -244,7 +255,7 @@ async def handle_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
     
     if callback.data == "chat":
-        await callback.message.answer("💬 Просто напиши мне любое сообщение, и я отвечу!")
+        await callback.message.answer("💬 Просто напиши мне любое сообщение, и я отвечу!\n\nЯ использую openrouter/auto — самую умную модель.")
     elif callback.data == "photo":
         await callback.message.answer("📸 Отправь мне фото с текстом, и я распознаю его!")
     elif callback.data == "generate":
@@ -252,7 +263,10 @@ async def handle_callback(callback: CallbackQuery):
             "🎨 **Что нарисовать?**\n\n"
             "Напиши в одном сообщении:\n"
             "`нарисуй кота в космосе`\n\n"
-            "Примеры: `нарисуй закат на море`, `нарисуй робота`"
+            "Примеры:\n"
+            "- `нарисуй закат на море`\n"
+            "- `нарисуй робота с книгой`\n"
+            "- `нарисуй горы и лес`"
         )
     elif callback.data == "clear":
         if user_id in user_histories:
@@ -262,22 +276,35 @@ async def handle_callback(callback: CallbackQuery):
         await callback.message.answer(
             "📊 **Статус бота**\n\n"
             f"• Активных диалогов: {len(user_histories)}\n"
-            "• Модели: Nemotron 3 Super, Qwen, Mistral\n"
-            "• Лимиты: 20 запросов/мин, 50/день (бесплатно)\n\n"
-            "💡 **Совет:** При ошибке 429 подождите 5-10 минут."
+            "• Основная модель: **openrouter/auto**\n"
+            "• Резервные модели: 4 шт.\n"
+            "• Распознавание фото: NVIDIA Nemotron Nano VL\n"
+            "• Генерация картинок: FLUX.1-dev\n\n"
+            "💡 **Совет:**\n"
+            "• openrouter/auto сам выбирает лучшую нейросеть\n"
+            "• При ошибке 429 бот переключается на другую модель\n"
+            "• Для увеличения лимита пополните баланс до $10"
         )
     elif callback.data == "help":
         await callback.message.answer(
             "📖 **Помощь**\n\n"
-            "• **Чат** — просто напиши текст\n"
-            "• **Распознать фото** — отправь картинку\n"
-            "• **Сгенерировать картинку** — напиши 'нарисуй ...'\n"
-            "• **Очистить историю** — бот забудет прошлые сообщения\n"
-            "• **Статус** — информация о работе бота\n\n"
-            "⚠️ **При ошибке 429:**\n"
-            "- Подождите 5-10 минут\n"
-            "- Лимиты обновляются в 00:00 UTC\n"
-            "- Или пополните баланс OpenRouter до $10"
+            "**Команды:**\n"
+            "/start — начать заново\n"
+            "/clear — очистить историю\n\n"
+            "**Кнопки:**\n"
+            "• 💬 Чат с ИИ — начать общение\n"
+            "• 📸 Распознать фото — отправить картинку\n"
+            "• 🎨 Сгенерировать картинку — написать 'нарисуй ...'\n"
+            "• 🗑 Очистить историю — забыть прошлые сообщения\n"
+            "• ❓ Помощь — это сообщение\n"
+            "• 📊 Статус — информация о работе\n\n"
+            "**Как это работает:**\n"
+            "Я использую **openrouter/auto** — специальную модель,\n"
+            "которая сама выбирает лучшую нейросеть для твоего вопроса.\n\n"
+            "**Если бот долго отвечает:**\n"
+            "- Подождите 5-10 секунд\n"
+            "- Бесплатные модели могут иметь очередь\n"
+            "- Пополните баланс OpenRouter для приоритета"
         )
     await callback.answer()
 
@@ -285,7 +312,7 @@ async def handle_callback(callback: CallbackQuery):
 @dp.message(lambda msg: msg.text and msg.text.lower().startswith("нарисуй"))
 async def handle_generate(message: types.Message):
     if not HF_TOKEN:
-        await message.answer("❌ Генерация картинок недоступна. Добавьте HF_TOKEN в Render.")
+        await message.answer("❌ Генерация картинок недоступна. Добавьте HF_TOKEN в переменные окружения Render.")
         return
     
     prompt = message.text.replace("нарисуй", "").strip()
@@ -304,7 +331,7 @@ async def handle_generate(message: types.Message):
         photo_file = BufferedInputFile(image_data, filename="image.png")
         await message.answer_photo(photo=photo_file, caption=f"🖼 *{prompt}*", parse_mode="Markdown")
     else:
-        await message.answer("❌ Не удалось сгенерировать картинку. Попробуйте другой запрос.")
+        await message.answer("❌ Не удалось сгенерировать картинку.\n\n💡 **Совет:**\n• Попробуйте другой запрос\n• Например: `нарисуй кота`\n• Или: `нарисуй закат`")
 
 @dp.message(lambda msg: msg.photo is not None)
 async def handle_photo(message: types.Message):
@@ -328,7 +355,7 @@ async def handle_photo(message: types.Message):
             result = result[:4000] + "\n\n...(текст обрезан)"
         await message.answer(f"📝 **Распознанный текст:**\n\n{result}", parse_mode="Markdown")
     else:
-        await message.answer("❌ Не удалось распознать текст. Попробуйте фото с более чётким текстом.")
+        await message.answer("❌ Не удалось распознать текст.\n\n💡 **Совет:**\n• Сделайте фото более чётким\n• Убедитесь, что текст крупный\n• Хорошее освещение поможет")
 
 @dp.message()
 async def handle_message(message: types.Message):
@@ -340,11 +367,19 @@ async def handle_message(message: types.Message):
     await message.answer(response)
 
 async def main():
-    logger.info("Бот запущен с авто-переключением моделей и обработкой 429 ошибок!")
+    logger.info("=" * 50)
+    logger.info("🚀 БОТ ЗАПУЩЕН")
+    logger.info(f"📱 Бот: @{(await bot.get_me()).username}")
+    logger.info(f"🤖 Модель: openrouter/auto (самый умный выбор)")
+    logger.info(f"📸 Распознавание: NVIDIA Nemotron Nano VL")
+    logger.info(f"🎨 Генерация: FLUX.1-dev через Hugging Face")
+    logger.info("=" * 50)
+    
     if HF_TOKEN:
-        logger.info("HF_TOKEN найден, генерация картинок доступна")
+        logger.info("✅ HF_TOKEN найден, генерация картинок доступна")
     else:
-        logger.warning("HF_TOKEN не найден, генерация картинок недоступна")
+        logger.warning("⚠️ HF_TOKEN не найден, генерация картинок НЕДОСТУПНА")
+    
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
