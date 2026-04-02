@@ -4,8 +4,6 @@ import logging
 import sqlite3
 import threading
 import json
-import io
-import pandas as pd
 from datetime import datetime
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
@@ -16,7 +14,7 @@ from flask import Flask
 load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
-ADMIN_IDS = [1912287053]
+ADMIN_IDS = [1912287053]  # ВАШ Telegram ID
 
 if not BOT_TOKEN:
     raise ValueError("Токен не найден!")
@@ -103,14 +101,12 @@ def init_db():
     conn.close()
     logger.info("База данных инициализирована")
 
-# --- Функции работы с БД ---
+# --- Функции работы с БД (SQLite) ---
 
 def get_products(sort: str = None):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
     query = "SELECT id, name, price, description, photo FROM products"
-    
     if sort == "price_asc":
         query += " ORDER BY price ASC"
     elif sort == "price_desc":
@@ -119,11 +115,10 @@ def get_products(sort: str = None):
         query += " ORDER BY name ASC"
     else:
         query += " ORDER BY id ASC"
-    
     cursor.execute(query)
     products = cursor.fetchall()
     conn.close()
-    return products
+    return [{'id': p[0], 'name': p[1], 'price': p[2], 'description': p[3], 'photo': p[4]} for p in products]
 
 def get_product(product_id: int):
     conn = sqlite3.connect(DB_PATH)
@@ -131,7 +126,9 @@ def get_product(product_id: int):
     cursor.execute("SELECT id, name, price, description, photo FROM products WHERE id = ?", (product_id,))
     product = cursor.fetchone()
     conn.close()
-    return product
+    if product:
+        return {'id': product[0], 'name': product[1], 'price': product[2], 'description': product[3], 'photo': product[4]}
+    return None
 
 def add_product(name: str, price: int, description: str):
     conn = sqlite3.connect(DB_PATH)
@@ -165,7 +162,7 @@ def get_cart(user_id: int):
     ''', (user_id,))
     cart = cursor.fetchall()
     conn.close()
-    return cart
+    return [{'product_id': item[0], 'name': item[1], 'price': item[2], 'quantity': item[3], 'photo': item[4]} for item in cart]
 
 def add_to_cart(user_id: int, product_id: int):
     conn = sqlite3.connect(DB_PATH)
@@ -206,15 +203,12 @@ def clear_cart(user_id: int):
 def create_order(user_id: int, cart_items, total: int):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
     items_json = json.dumps(cart_items)
     order_date = datetime.now().strftime("%d.%m.%Y %H:%M")
-    
     cursor.execute('''
         INSERT INTO orders (user_id, order_date, total, status, items)
         VALUES (?, ?, ?, ?, ?)
     ''', (user_id, order_date, total, "pending", items_json))
-    
     order_id = cursor.lastrowid
     conn.commit()
     conn.close()
@@ -236,7 +230,7 @@ def get_user_orders(user_id: int):
     )
     orders = cursor.fetchall()
     conn.close()
-    return orders
+    return [{'id': o[0], 'order_date': o[1], 'total': o[2], 'status': o[3]} for o in orders]
 
 def get_all_orders():
     conn = sqlite3.connect(DB_PATH)
@@ -246,24 +240,19 @@ def get_all_orders():
     )
     orders = cursor.fetchall()
     conn.close()
-    return orders
+    return [{'id': o[0], 'user_id': o[1], 'order_date': o[2], 'total': o[3], 'status': o[4]} for o in orders]
 
 def get_stats():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
     cursor.execute("SELECT COUNT(DISTINCT user_id) FROM orders")
-    users = cursor.fetchone()[0]
-    
+    users = cursor.fetchone()[0] or 0
     cursor.execute("SELECT COUNT(*) FROM orders")
-    orders_count = cursor.fetchone()[0]
-    
+    orders_count = cursor.fetchone()[0] or 0
     cursor.execute("SELECT SUM(total) FROM orders")
     revenue = cursor.fetchone()[0] or 0
-    
     cursor.execute("SELECT COUNT(*) FROM products")
-    products_count = cursor.fetchone()[0]
-    
+    products_count = cursor.fetchone()[0] or 0
     conn.close()
     return users, orders_count, revenue, products_count
 
@@ -292,7 +281,7 @@ def get_wishlist(user_id: int):
     ''', (user_id,))
     wishlist = cursor.fetchall()
     conn.close()
-    return wishlist
+    return [{'id': w[0], 'name': w[1], 'price': w[2], 'description': w[3], 'photo': w[4]} for w in wishlist]
 
 def is_in_wishlist(user_id: int, product_id: int):
     conn = sqlite3.connect(DB_PATH)
@@ -302,115 +291,35 @@ def is_in_wishlist(user_id: int, product_id: int):
     conn.close()
     return result is not None
 
-# --- Импорт из Excel ---
-async def import_products_from_excel(file_bytes: bytes) -> tuple:
-    """
-    Импортирует товары из Excel файла (ДОБАВЛЯЕТ к существующим, не удаляя старые)
-    Возвращает (количество_добавленных, список_ошибок)
-    """
-    try:
-        df = pd.read_excel(io.BytesIO(file_bytes))
-        
-        required_columns = ['name', 'price', 'description']
-        missing_columns = [col for col in required_columns if col not in df.columns]
-        
-        if missing_columns:
-            return 0, [f"Отсутствуют колонки: {', '.join(missing_columns)}"]
-        
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        added = 0
-        errors = []
-        
-        for index, row in df.iterrows():
-            try:
-                name = str(row['name']).strip()
-                price = int(float(row['price']))
-                description = str(row['description']).strip()
-                
-                if not name or price <= 0:
-                    errors.append(f"Строка {index + 2}: неверные данные (name='{name}', price={price})")
-                    continue
-                
-                # ДОБАВЛЯЕМ, а не заменяем
-                cursor.execute(
-                    "INSERT INTO products (name, price, description) VALUES (?, ?, ?)",
-                    (name, price, description)
-                )
-                added += 1
-                
-            except Exception as e:
-                errors.append(f"Строка {index + 2}: {str(e)}")
-        
-        conn.commit()
-        conn.close()
-        
-        return added, errors
-        
-    except Exception as e:
-        return 0, [f"Ошибка чтения файла: {str(e)}"]
-
 # --- Клавиатуры ---
-
 def main_menu_keyboard(is_admin: bool = False):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="📋 Каталог", callback_data="catalog"),
-            InlineKeyboardButton(text="🛒 Корзина", callback_data="cart")
-        ],
-        [
-            InlineKeyboardButton(text="📦 Мои заказы", callback_data="my_orders"),
-            InlineKeyboardButton(text="❤️ Избранное", callback_data="wishlist")
-        ],
-        [
-            InlineKeyboardButton(text="👤 Профиль", callback_data="profile")
-        ]
+        [InlineKeyboardButton(text="📋 Каталог", callback_data="catalog"), InlineKeyboardButton(text="🛒 Корзина", callback_data="cart")],
+        [InlineKeyboardButton(text="📦 Мои заказы", callback_data="my_orders"), InlineKeyboardButton(text="❤️ Избранное", callback_data="wishlist")],
+        [InlineKeyboardButton(text="👤 Профиль", callback_data="profile")]
     ])
     if is_admin:
-        keyboard.inline_keyboard.append([
-            InlineKeyboardButton(text="🔐 Админ панель", callback_data="admin_panel")
-        ])
+        keyboard.inline_keyboard.append([InlineKeyboardButton(text="🔐 Админ панель", callback_data="admin_panel")])
     return keyboard
 
 def admin_panel_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats"),
-            InlineKeyboardButton(text="➕ Добавить товар", callback_data="admin_add_product")
-        ],
-        [
-            InlineKeyboardButton(text="📋 Товары", callback_data="admin_products"),
-            InlineKeyboardButton(text="📥 Импорт из Excel", callback_data="admin_import_excel")
-        ],
-        [
-            InlineKeyboardButton(text="📦 Заказы", callback_data="admin_orders"),
-            InlineKeyboardButton(text="🔄 Статусы заказов", callback_data="admin_update_status")
-        ],
-        [
-            InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")
-        ]
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats"), InlineKeyboardButton(text="➕ Добавить товар", callback_data="admin_add_product")],
+        [InlineKeyboardButton(text="📋 Товары", callback_data="admin_products"), InlineKeyboardButton(text="📦 Заказы", callback_data="admin_orders")],
+        [InlineKeyboardButton(text="🔄 Статусы заказов", callback_data="admin_update_status"), InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
     ])
 
 def product_card_keyboard(product_id: int, user_id: int, in_cart: bool = False):
     buttons = []
-    
     if in_cart:
-        buttons.append([
-            InlineKeyboardButton(text="➖", callback_data=f"cart_decr_{product_id}"),
-            InlineKeyboardButton(text="❌ Удалить", callback_data=f"remove_from_cart_{product_id}"),
-            InlineKeyboardButton(text="➕", callback_data=f"cart_incr_{product_id}")
-        ])
+        buttons.append([InlineKeyboardButton(text="➖", callback_data=f"cart_decr_{product_id}"), InlineKeyboardButton(text="❌ Удалить", callback_data=f"remove_from_cart_{product_id}"), InlineKeyboardButton(text="➕", callback_data=f"cart_incr_{product_id}")])
     else:
         buttons.append([InlineKeyboardButton(text="🛒 Добавить в корзину", callback_data=f"add_to_cart_{product_id}")])
-    
     if is_in_wishlist(user_id, product_id):
         buttons.append([InlineKeyboardButton(text="❤️ В избранном", callback_data=f"remove_wishlist_{product_id}")])
     else:
         buttons.append([InlineKeyboardButton(text="🤍 В избранное", callback_data=f"add_wishlist_{product_id}")])
-    
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="catalog")])
-    
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def cart_keyboard():
@@ -427,68 +336,48 @@ def order_confirmation_keyboard():
     ])
 
 def update_status_keyboard(order_id: int, current_status: str):
-    statuses = [
-        ("🟡 Ожидает", "pending"),
-        ("🟢 В пути", "shipping"),
-        ("✅ Доставлен", "delivered"),
-        ("❌ Отменён", "cancelled")
-    ]
-    
+    statuses = [("🟡 Ожидает", "pending"), ("🟢 В пути", "shipping"), ("✅ Доставлен", "delivered"), ("❌ Отменён", "cancelled")]
     buttons = []
     for name, code in statuses:
         if code != current_status:
             buttons.append([InlineKeyboardButton(text=name, callback_data=f"set_status_{order_id}_{code}")])
-    
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="admin_orders")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 # --- Вспомогательные функции ---
-
 async def show_product_list(callback: CallbackQuery, products, title, back_keyboard=None):
     if not products:
         await callback.message.edit_text("📭 **Каталог пуст**", reply_markup=back_keyboard or main_menu_keyboard(callback.from_user.id in ADMIN_IDS), parse_mode="Markdown")
         return
-    
     keyboard = InlineKeyboardMarkup(inline_keyboard=[])
     for p in products:
-        keyboard.inline_keyboard.append([
-            InlineKeyboardButton(text=f"{p[1]} - {p[2]} ₽", callback_data=f"product_{p[0]}")
-        ])
+        keyboard.inline_keyboard.append([InlineKeyboardButton(text=f"{p['name']} - {p['price']} ₽", callback_data=f"product_{p['id']}")])
     keyboard.inline_keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")])
-    
     await callback.message.edit_text(title, reply_markup=keyboard, parse_mode="Markdown")
 
 async def show_cart(callback: CallbackQuery, user_id: int):
     cart = get_cart(user_id)
     is_admin = user_id in ADMIN_IDS
-    
     if not cart:
         await callback.message.edit_text("🛒 **Корзина пуста**", reply_markup=main_menu_keyboard(is_admin), parse_mode="Markdown")
         return
-    
     total = 0
     text = "🛒 **Ваша корзина**\n\n"
-    
     for item in cart:
-        subtotal = item[2] * item[3]
+        subtotal = item['price'] * item['quantity']
         total += subtotal
-        text += f"• {item[1]} x{item[3]} = {subtotal} ₽\n"
-    
+        text += f"• {item['name']} x{item['quantity']} = {subtotal} ₽\n"
     text += f"\n**Итого: {total} ₽**"
-    
     await callback.message.edit_text(text, reply_markup=cart_keyboard(), parse_mode="Markdown")
 
 # --- Обработчики ---
-
 @dp.message(Command("start"))
 async def start_command(message: types.Message):
     user_id = message.from_user.id
     is_admin = user_id in ADMIN_IDS
-    
     text = "🛍 **Добро пожаловать в магазин!**\n\nЗдесь вы можете:\n• 📋 Посмотреть каталог\n• 🛒 Добавить товары в корзину\n• ✅ Оформить заказ\n• ❤️ Добавить товары в избранное"
     if is_admin:
         text += "\n\n🔐 **Вы вошли как администратор**"
-    
     await message.answer(text, reply_markup=main_menu_keyboard(is_admin), parse_mode="Markdown")
 
 @dp.callback_query()
@@ -496,246 +385,185 @@ async def handle_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
     data = callback.data
     is_admin = user_id in ADMIN_IDS
-    
     await callback.answer()
     
-    # --- Навигация ---
     if data == "back_to_main":
         await callback.message.edit_text("🛍 **Главное меню**", reply_markup=main_menu_keyboard(is_admin), parse_mode="Markdown")
-    
     elif data == "admin_panel" and is_admin:
         await callback.message.edit_text("🔐 **Панель администратора**", reply_markup=admin_panel_keyboard(), parse_mode="Markdown")
-    
-    # --- Каталог ---
     elif data == "catalog":
         products = get_products()
         await show_product_list(callback, products, "📋 **Каталог товаров**\n\n", main_menu_keyboard(is_admin))
-    
     elif data.startswith("product_"):
         product_id = int(data.split("_")[1])
         product = get_product(product_id)
         if not product:
             await callback.message.answer("❌ Товар не найден")
             return
-        
         cart = get_cart(user_id)
-        in_cart = any(c[0] == product_id for c in cart)
-        
-        text = f"**{product[1]}**\n\n💰 Цена: {product[2]} ₽\n📝 {product[3]}"
-        
-        if product[4]:
-            await bot.send_photo(user_id, product[4], caption=text, reply_markup=product_card_keyboard(product_id, user_id, in_cart), parse_mode="Markdown")
+        in_cart = any(c['product_id'] == product_id for c in cart)
+        text = f"**{product['name']}**\n\n💰 Цена: {product['price']} ₽\n📝 {product['description']}"
+        if product['photo']:
+            await bot.send_photo(user_id, product['photo'], caption=text, reply_markup=product_card_keyboard(product_id, user_id, in_cart), parse_mode="Markdown")
             await callback.message.delete()
         else:
             await callback.message.edit_text(text, reply_markup=product_card_keyboard(product_id, user_id, in_cart), parse_mode="Markdown")
-    
-    # --- Корзина ---
     elif data.startswith("add_to_cart_"):
         product_id = int(data.split("_")[3])
         add_to_cart(user_id, product_id)
         await callback.message.answer("✅ Товар добавлен в корзину!")
-    
     elif data.startswith("cart_incr_"):
         product_id = int(data.split("_")[2])
         add_to_cart(user_id, product_id)
         await show_cart(callback, user_id)
-    
     elif data.startswith("cart_decr_"):
         product_id = int(data.split("_")[2])
         cart = get_cart(user_id)
         for item in cart:
-            if item[0] == product_id:
-                new_qty = item[3] - 1
+            if item['product_id'] == product_id:
+                new_qty = item['quantity'] - 1
                 update_cart_quantity(user_id, product_id, new_qty)
                 break
         await show_cart(callback, user_id)
-    
     elif data.startswith("remove_from_cart_"):
         product_id = int(data.split("_")[3])
         remove_from_cart(user_id, product_id)
         await callback.message.answer("❌ Товар удалён из корзины!")
         await show_cart(callback, user_id)
-    
     elif data == "cart":
         await show_cart(callback, user_id)
-    
     elif data == "clear_cart":
         clear_cart(user_id)
         await callback.message.edit_text("🛒 **Корзина очищена**", reply_markup=main_menu_keyboard(is_admin), parse_mode="Markdown")
-    
     elif data == "checkout":
         cart = get_cart(user_id)
         if not cart:
             await callback.message.answer("🛒 Корзина пуста")
             return
-        
         total = 0
         items_text = ""
         for item in cart:
-            subtotal = item[2] * item[3]
+            subtotal = item['price'] * item['quantity']
             total += subtotal
-            items_text += f"• {item[1]} x{item[3]} = {subtotal} ₽\n"
-        
+            items_text += f"• {item['name']} x{item['quantity']} = {subtotal} ₽\n"
         text = f"📦 **Подтверждение заказа**\n\n{items_text}\n**Итого: {total} ₽**"
         await callback.message.edit_text(text, reply_markup=order_confirmation_keyboard(), parse_mode="Markdown")
-    
     elif data == "confirm_order":
         cart = get_cart(user_id)
         if not cart:
             await callback.message.answer("❌ Корзина пуста")
             return
-        
         total = 0
         items = []
         for item in cart:
-            subtotal = item[2] * item[3]
+            subtotal = item['price'] * item['quantity']
             total += subtotal
-            items.append({
-                "product_id": item[0],
-                "name": item[1],
-                "price": item[2],
-                "quantity": item[3],
-                "subtotal": subtotal
-            })
-        
+            items.append({"product_id": item['product_id'], "name": item['name'], "price": item['price'], "quantity": item['quantity'], "subtotal": subtotal})
         order_id = create_order(user_id, items, total)
         clear_cart(user_id)
-        
         text = f"✅ **Заказ #{order_id} оформлен!**\n\n💰 Сумма: {total} ₽\nСтатус можно отслеживать в «Мои заказы»"
         await callback.message.edit_text(text, reply_markup=main_menu_keyboard(is_admin), parse_mode="Markdown")
-        
         for admin_id in ADMIN_IDS:
             try:
                 await bot.send_message(admin_id, f"🆕 **Новый заказ #{order_id}!**\nПользователь: {callback.from_user.id}\nСумма: {total} ₽")
-            except:
-                pass
-    
-    # --- Заказы пользователя ---
+            except: pass
     elif data == "my_orders":
         orders = get_user_orders(user_id)
         if not orders:
             await callback.message.edit_text("📦 **У вас пока нет заказов**", reply_markup=main_menu_keyboard(is_admin), parse_mode="Markdown")
             return
-        
         text = "📦 **Ваши заказы**\n\n"
         for order in orders:
-            status_emoji = "🟡" if order[3] == "pending" else ("🟢" if order[3] == "shipping" else ("✅" if order[3] == "delivered" else "❌"))
-            text += f"{status_emoji} **Заказ #{order[0]}**\n📅 {order[1]}\n💰 {order[2]} ₽\n\n"
+            status_emoji = "🟡" if order['status'] == "pending" else ("🟢" if order['status'] == "shipping" else ("✅" if order['status'] == "delivered" else "❌"))
+            text += f"{status_emoji} **Заказ #{order['id']}**\n📅 {order['order_date']}\n💰 {order['total']} ₽\n\n"
         await callback.message.edit_text(text, reply_markup=main_menu_keyboard(is_admin), parse_mode="Markdown")
-    
-    # --- Профиль ---
     elif data == "profile":
         orders = get_user_orders(user_id)
-        total_spent = sum(o[2] for o in orders)
+        total_spent = sum(o['total'] for o in orders)
         text = f"👤 **Ваш профиль**\n\n🆔 ID: {user_id}\n📦 Заказов: {len(orders)}\n💰 Потрачено: {total_spent} ₽\n🛒 Товаров в корзине: {len(get_cart(user_id))}\n❤️ В избранном: {len(get_wishlist(user_id))}"
         await callback.message.edit_text(text, reply_markup=main_menu_keyboard(is_admin), parse_mode="Markdown")
-    
-    # --- Избранное ---
     elif data.startswith("add_wishlist_"):
         product_id = int(data.split("_")[2])
         add_to_wishlist(user_id, product_id)
         await callback.message.answer("❤️ Товар добавлен в избранное!")
-    
     elif data.startswith("remove_wishlist_"):
         product_id = int(data.split("_")[2])
         remove_from_wishlist(user_id, product_id)
         await callback.message.answer("🤍 Товар удалён из избранного!")
-    
     elif data == "wishlist":
         wishlist = get_wishlist(user_id)
         if not wishlist:
             await callback.message.edit_text("❤️ **Избранное пусто**", reply_markup=main_menu_keyboard(is_admin), parse_mode="Markdown")
             return
-        
         text = "❤️ **Ваше избранное**\n\n"
         keyboard = InlineKeyboardMarkup(inline_keyboard=[])
         for item in wishlist:
-            text += f"• {item[1]} - {item[2]} ₽\n"
-            keyboard.inline_keyboard.append([
-                InlineKeyboardButton(text=f"📦 {item[1]}", callback_data=f"product_{item[0]}")
-            ])
+            text += f"• {item['name']} - {item['price']} ₽\n"
+            keyboard.inline_keyboard.append([InlineKeyboardButton(text=f"📦 {item['name']}", callback_data=f"product_{item['id']}")])
         keyboard.inline_keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")])
         await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
-    
-    # --- Админ функции ---
     elif data == "admin_stats" and is_admin:
         users, orders_count, revenue, products_count = get_stats()
         text = f"📊 **Статистика**\n\n👥 Пользователей: {users}\n📦 Заказов: {orders_count}\n💰 Выручка: {revenue} ₽\n🛒 Товаров: {products_count}"
         await callback.message.edit_text(text, reply_markup=admin_panel_keyboard(), parse_mode="Markdown")
-    
     elif data == "admin_products" and is_admin:
         products = get_products()
         if not products:
             await callback.message.edit_text("📭 **Нет товаров**", reply_markup=admin_panel_keyboard(), parse_mode="Markdown")
             return
-        
         text = "📋 **Управление товарами**\n\n"
         keyboard = InlineKeyboardMarkup(inline_keyboard=[])
         for p in products:
-            text += f"• {p[1]} - {p[2]} ₽\n"
-            keyboard.inline_keyboard.append([
-                InlineKeyboardButton(text=f"❌ Удалить {p[1]}", callback_data=f"admin_delete_product_{p[0]}")
-            ])
+            text += f"• {p['name']} - {p['price']} ₽\n"
+            keyboard.inline_keyboard.append([InlineKeyboardButton(text=f"❌ Удалить {p['name']}", callback_data=f"admin_delete_product_{p['id']}")])
         keyboard.inline_keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel")])
         await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
-    
     elif data.startswith("admin_delete_product_") and is_admin:
         product_id = int(data.split("_")[3])
         product = get_product(product_id)
         if product:
             delete_product(product_id)
-            await callback.message.answer(f"✅ Товар «{product[1]}» удалён")
+            await callback.message.answer(f"✅ Товар «{product['name']}» удалён")
         else:
             await callback.message.answer("❌ Товар не найден")
-    
     elif data == "admin_orders" and is_admin:
         all_orders = get_all_orders()
         if not all_orders:
             await callback.message.edit_text("📦 **Нет заказов**", reply_markup=admin_panel_keyboard(), parse_mode="Markdown")
             return
-        
         text = "📦 **Все заказы**\n\n"
         keyboard = InlineKeyboardMarkup(inline_keyboard=[])
         for order in all_orders:
-            status_emoji = "🟡" if order[4] == "pending" else ("🟢" if order[4] == "shipping" else ("✅" if order[4] == "delivered" else "❌"))
-            text += f"{status_emoji} **Заказ #{order[0]}**\n👤 Пользователь: {order[1]}\n📅 {order[2]}\n💰 {order[3]} ₽\n\n"
-            keyboard.inline_keyboard.append([
-                InlineKeyboardButton(text=f"🔄 Заказ #{order[0]}", callback_data=f"update_status_{order[0]}")
-            ])
+            status_emoji = "🟡" if order['status'] == "pending" else ("🟢" if order['status'] == "shipping" else ("✅" if order['status'] == "delivered" else "❌"))
+            text += f"{status_emoji} **Заказ #{order['id']}**\n👤 Пользователь: {order['user_id']}\n📅 {order['order_date']}\n💰 {order['total']} ₽\n\n"
+            keyboard.inline_keyboard.append([InlineKeyboardButton(text=f"🔄 Заказ #{order['id']}", callback_data=f"update_status_{order['id']}")])
         keyboard.inline_keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel")])
         await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
-    
     elif data.startswith("update_status_") and is_admin:
         order_id = int(data.split("_")[2])
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT status FROM orders WHERE id = ?", (order_id,))
-        current_status = cursor.fetchone()[0]
-        conn.close()
-        
-        await callback.message.edit_text(f"🔄 **Заказ #{order_id}**\n\nТекущий статус: {current_status}\n\nВыберите новый статус:", reply_markup=update_status_keyboard(order_id, current_status), parse_mode="Markdown")
-    
+        current_status = None
+        for order in get_all_orders():
+            if order['id'] == order_id:
+                current_status = order['status']
+                break
+        if current_status:
+            await callback.message.edit_text(f"🔄 **Заказ #{order_id}**\n\nТекущий статус: {current_status}\n\nВыберите новый статус:", reply_markup=update_status_keyboard(order_id, current_status), parse_mode="Markdown")
     elif data.startswith("set_status_") and is_admin:
         parts = data.split("_")
         order_id = int(parts[2])
         new_status = parts[3]
-        
         update_order_status(order_id, new_status)
-        
         status_names = {"pending": "🟡 Ожидает", "shipping": "🟢 В пути", "delivered": "✅ Доставлен", "cancelled": "❌ Отменён"}
         await callback.message.answer(f"✅ Статус заказа #{order_id} изменён на {status_names.get(new_status, new_status)}")
-        
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT user_id FROM orders WHERE id = ?", (order_id,))
-        user_id_order = cursor.fetchone()[0]
-        conn.close()
-        
-        try:
-            await bot.send_message(user_id_order, f"🔄 Статус вашего заказа #{order_id} изменён на {status_names.get(new_status, new_status)}")
-        except:
-            pass
-    
+        order_info = None
+        for order in get_all_orders():
+            if order['id'] == order_id:
+                order_info = order
+                break
+        if order_info:
+            try:
+                await bot.send_message(order_info['user_id'], f"🔄 Статус вашего заказа #{order_id} изменён на {status_names.get(new_status, new_status)}")
+            except: pass
     elif data == "admin_add_product" and is_admin:
         await callback.message.edit_text(
             "📝 **Добавление товара**\n\nОтправьте данные в формате:\n`Название | Цена | Описание`\n\nПример:\n`Кроссовки Nike | 8900 | Спортивные кроссовки`",
@@ -744,7 +572,6 @@ async def handle_callback(callback: CallbackQuery):
         )
         dp.awaiting_product = getattr(dp, "awaiting_product", set())
         dp.awaiting_product.add(user_id)
-    
     elif data == "admin_update_status" and is_admin:
         await callback.message.edit_text(
             "🔄 **Изменение статуса заказа**\n\nВведите номер заказа:",
@@ -753,43 +580,20 @@ async def handle_callback(callback: CallbackQuery):
         )
         dp.waiting_for_order_id = getattr(dp, "waiting_for_order_id", set())
         dp.waiting_for_order_id.add(user_id)
-    
-    # --- ИМПОРТ ИЗ EXCEL ---
-    elif data == "admin_import_excel" and is_admin:
-        await callback.message.edit_text(
-            "📥 **Импорт товаров из Excel**\n\n"
-            "Отправьте Excel файл (.xlsx) со следующими колонками:\n\n"
-            "| Колонка | Описание | Пример |\n"
-            "|---------|----------|--------|\n"
-            "| name | Название товара | Кроссовки Nike |\n"
-            "| price | Цена (число) | 8900 |\n"
-            "| description | Описание | Спортивные кроссовки |\n\n"
-            "📌 **Важно:** Первая строка файла должна содержать названия колонок!\n\n"
-            "✅ Товары **добавятся** к существующим (старые останутся)\n\n"
-            "📎 Отправьте файл в этот чат:",
-            reply_markup=admin_panel_keyboard(),
-            parse_mode="Markdown"
-        )
-        dp.waiting_for_excel = getattr(dp, "waiting_for_excel", set())
-        dp.waiting_for_excel.add(user_id)
 
-# --- Обработка ввода ---
 @dp.message()
 async def handle_input(message: types.Message):
     user_id = message.from_user.id
     is_admin = user_id in ADMIN_IDS
     
-    # Добавление товара вручную
     if hasattr(dp, "awaiting_product") and user_id in dp.awaiting_product:
         dp.awaiting_product.remove(user_id)
-        
         try:
             parts = message.text.split("|")
             if len(parts) >= 3:
                 name = parts[0].strip()
                 price = int(parts[1].strip())
                 desc = parts[2].strip()
-                
                 product_id = add_product(name, price, desc)
                 await message.answer(f"✅ Товар «{name}» добавлен! ID: {product_id}")
             else:
@@ -798,23 +602,19 @@ async def handle_input(message: types.Message):
             await message.answer("❌ Цена должна быть числом")
         except Exception as e:
             await message.answer(f"❌ Ошибка: {e}")
-        
         await message.answer("🛍 Вернуться в меню:", reply_markup=main_menu_keyboard(is_admin))
         return
     
-    # Изменение статуса заказа по номеру
     if hasattr(dp, "waiting_for_order_id") and user_id in dp.waiting_for_order_id:
         dp.waiting_for_order_id.remove(user_id)
         try:
             order_id = int(message.text.strip())
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute("SELECT status FROM orders WHERE id = ?", (order_id,))
-            result = cursor.fetchone()
-            conn.close()
-            
-            if result:
-                current_status = result[0]
+            current_status = None
+            for order in get_all_orders():
+                if order['id'] == order_id:
+                    current_status = order['status']
+                    break
+            if current_status:
                 await message.answer(f"🔄 **Заказ #{order_id}**\n\nТекущий статус: {current_status}\n\nВыберите новый статус:", reply_markup=update_status_keyboard(order_id, current_status), parse_mode="Markdown")
             else:
                 await message.answer(f"❌ Заказ #{order_id} не найден")
@@ -822,71 +622,4 @@ async def handle_input(message: types.Message):
             await message.answer("❌ Введите номер заказа (цифрами)")
         return
     
-    # Обычное сообщение
-    await message.answer("🛍 Используйте кнопки для навигации.", reply_markup=main_menu_keyboard(is_admin))
-
-# --- Обработчик Excel файлов (импорт) ---
-@dp.message(lambda msg: msg.document and msg.document.file_name and msg.document.file_name.endswith(('.xlsx', '.xls')))
-async def handle_excel_import(message: types.Message):
-    user_id = message.from_user.id
-    is_admin = user_id in ADMIN_IDS
-    
-    # Проверяем, ждём ли мы файл
-    if not hasattr(dp, "waiting_for_excel") or user_id not in dp.waiting_for_excel:
-        # Если не ждём, но файл пришёл — игнорируем
-        return
-    
-    dp.waiting_for_excel.remove(user_id)
-    
-    if not is_admin:
-        await message.answer("❌ У вас нет прав на импорт товаров")
-        return
-    
-    status_msg = await message.answer("📥 Загружаю файл...")
-    
-    try:
-        # Скачиваем файл
-        file = await bot.get_file(message.document.file_id)
-        file_bytes = io.BytesIO()
-        await bot.download_file(file.file_path, destination=file_bytes)
-        file_bytes.seek(0)
-        
-        await status_msg.edit_text("📊 Обрабатываю файл...")
-        
-        # Импортируем товары
-        added, errors = await import_products_from_excel(file_bytes.getvalue())
-        
-        # Отправляем результат
-        result_text = f"✅ **Импорт завершён!**\n\n"
-        result_text += f"📦 Добавлено товаров: {added}\n"
-        
-        if errors:
-            result_text += f"\n⚠️ **Ошибки ({len(errors)}):**\n"
-            for err in errors[:5]:
-                result_text += f"• {err}\n"
-            if len(errors) > 5:
-                result_text += f"• ... и ещё {len(errors) - 5} ошибок\n"
-        
-        await status_msg.delete()
-        await message.answer(result_text, parse_mode="Markdown")
-        
-        # Показываем кнопку возврата в админку
-        await message.answer("🔐 Вернуться в админ-панель:", reply_markup=admin_panel_keyboard())
-        
-    except Exception as e:
-        await status_msg.delete()
-        await message.answer(f"❌ Ошибка при импорте: {str(e)}")
-
-# --- Запуск ---
-async def main():
-    init_db()
-    logger.info("=" * 40)
-    logger.info("🛍 БОТ-МАГАЗИН ЗАПУЩЕН")
-    logger.info(f"🤖 Бот: @{(await bot.get_me()).username}")
-    logger.info(f"👑 Администратор: {ADMIN_IDS}")
-    logger.info(f"📥 Импорт из Excel: ДОБАВЛЯЕТ товары к существующим")
-    logger.info("=" * 40)
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    await message.answer("🛍 Используйте кнопки для навигации.", reply_markup=main_menu
