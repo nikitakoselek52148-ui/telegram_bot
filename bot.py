@@ -47,7 +47,6 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # Таблица пользователей
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -59,7 +58,6 @@ def init_db():
         )
     ''')
     
-    # Таблица товаров
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -70,7 +68,6 @@ def init_db():
         )
     ''')
     
-    # Таблица корзин
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS carts (
             user_id INTEGER NOT NULL,
@@ -80,7 +77,6 @@ def init_db():
         )
     ''')
     
-    # Таблица заказов
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -92,7 +88,6 @@ def init_db():
         )
     ''')
     
-    # Таблица избранного
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS wishlist (
             user_id INTEGER NOT NULL,
@@ -101,7 +96,6 @@ def init_db():
         )
     ''')
     
-    # Добавляем тестовые товары
     cursor.execute("SELECT COUNT(*) FROM products")
     if cursor.fetchone()[0] == 0:
         test_products = [
@@ -121,7 +115,6 @@ def init_db():
 
 # --- Функции для рассылок ---
 def get_all_users():
-    """Получить всех пользователей для рассылки"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT user_id FROM users")
@@ -129,8 +122,16 @@ def get_all_users():
     conn.close()
     return [u[0] for u in users]
 
+def get_all_users_list():
+    """Получить список всех пользователей с деталями"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, phone, first_name, last_name, username, registered_at FROM users ORDER BY registered_at DESC")
+    users = cursor.fetchall()
+    conn.close()
+    return [{'user_id': u[0], 'phone': u[1] or 'Не указан', 'first_name': u[2] or '', 'last_name': u[3] or '', 'username': u[4] or '', 'registered_at': u[5]} for u in users]
+
 async def send_broadcast_to_all(message_text: str, photo: str = None, product_id: int = None):
-    """Отправляет сообщение всем пользователям"""
     users = get_all_users()
     success = 0
     fail = 0
@@ -138,7 +139,6 @@ async def send_broadcast_to_all(message_text: str, photo: str = None, product_id
     for user_id in users:
         try:
             if product_id:
-                # Товар-новость с кнопкой
                 product = get_product(product_id)
                 if product:
                     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -152,7 +152,6 @@ async def send_broadcast_to_all(message_text: str, photo: str = None, product_id
                 else:
                     await bot.send_message(user_id, message_text)
             else:
-                # Обычная новость
                 if photo:
                     await bot.send_photo(user_id, photo, caption=message_text)
                 else:
@@ -404,7 +403,7 @@ def admin_panel_keyboard():
         [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats"), InlineKeyboardButton(text="➕ Добавить товар", callback_data="admin_add_product")],
         [InlineKeyboardButton(text="📋 Товары", callback_data="admin_products"), InlineKeyboardButton(text="📦 Заказы", callback_data="admin_orders")],
         [InlineKeyboardButton(text="🔄 Статусы заказов", callback_data="admin_update_status"), InlineKeyboardButton(text="📢 Создать рассылку", callback_data="admin_create_broadcast")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
+        [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_users"), InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
     ])
 
 def broadcast_keyboard():
@@ -900,6 +899,35 @@ async def handle_callback(callback: CallbackQuery):
         )
         dp.waiting_for_order_id = getattr(dp, "waiting_for_order_id", set())
         dp.waiting_for_order_id.add(user_id)
+    
+    # --- НОВАЯ КНОПКА: ПОЛЬЗОВАТЕЛИ ---
+    elif data == "admin_users" and is_admin:
+        users = get_all_users_list()
+        if not users:
+            await callback.message.edit_text("👥 <b>Нет пользователей</b>", reply_markup=admin_panel_keyboard(), parse_mode="HTML")
+            return
+        
+        text = "👥 <b>Список пользователей</b>\n\n"
+        text += f"📊 Всего: {len(users)}\n\n"
+        
+        for u in users[:20]:
+            text += f"🆔 ID: {u['user_id']}\n"
+            text += f"📱 Телефон: {u['phone']}\n"
+            if u['first_name']:
+                text += f"👤 Имя: {u['first_name']} {u['last_name']}\n"
+            if u['username']:
+                text += f"🔗 Username: @{u['username']}\n"
+            text += f"📅 Регистрация: {u['registered_at']}\n"
+            text += "─" * 20 + "\n"
+        
+        if len(users) > 20:
+            text += f"\n📌 ... и ещё {len(users) - 20} пользователей"
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel")]
+        ])
+        
+        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
 
 async def update_cart_message(callback: CallbackQuery, user_id: int, is_admin: bool):
     cart = get_cart(user_id)
@@ -947,7 +975,6 @@ async def handle_input(message: types.Message):
                 product_id = add_product(name, price, desc)
                 await message.answer(f"✅ Товар «{name}» добавлен! ID: {product_id}")
                 
-                # Предлагаем добавить фото
                 await message.answer("📸 Хотите добавить фото товара? Отправьте фото сейчас или нажмите /skip")
                 dp.waiting_for_photo = getattr(dp, "waiting_for_photo", set())
                 dp.waiting_for_photo.add((user_id, product_id))
@@ -989,7 +1016,6 @@ async def handle_input(message: types.Message):
         broadcast_data = dp.awaiting_broadcast[user_id]
         text = message.text.strip()
         
-        # Отправляем рассылку
         success, fail = await send_broadcast_to_all(
             message_text=text,
             product_id=broadcast_data.get("product_id") if broadcast_data["type"] == "product" else None
@@ -997,7 +1023,6 @@ async def handle_input(message: types.Message):
         
         await message.answer(f"✅ Рассылка отправлена!\n\n📨 Получили: {success}\n❌ Не доставлено: {fail}")
         
-        # Предлагаем добавить фото
         if broadcast_data["type"] == "news":
             await message.answer("📸 Хотите добавить фото к новости? Отправьте фото сейчас или нажмите /skip")
             dp.waiting_for_broadcast_photo = getattr(dp, "waiting_for_broadcast_photo", {})
@@ -1010,7 +1035,7 @@ async def handle_input(message: types.Message):
         del dp.awaiting_broadcast[user_id]
         return
     
-    # Добавление фото к рассылке (дополнительная отправка с фото)
+    # Добавление фото к рассылке
     if hasattr(dp, "waiting_for_broadcast_photo") and user_id in dp.waiting_for_broadcast_photo:
         data = dp.waiting_for_broadcast_photo[user_id]
         
@@ -1021,7 +1046,6 @@ async def handle_input(message: types.Message):
         
         if message.photo:
             photo = message.photo[-1]
-            # Отправляем повторно с фото
             success, fail = await send_broadcast_to_all(
                 message_text=data["text"],
                 photo=photo.file_id,
@@ -1060,7 +1084,7 @@ async def set_commands():
 async def main():
     init_db()
     await set_commands()
-    logger.info("🛍 БОТ-МАГАЗИН ЗАПУЩЕН с рассылкой новостей")
+    logger.info("🛍 БОТ-МАГАЗИН ЗАПУЩЕН с рассылкой новостей и списком пользователей")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
