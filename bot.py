@@ -121,8 +121,9 @@ if os.environ.get('RENDER', 'false').lower() == 'true':
     logger.info(f"Web server started on port {os.environ.get('PORT', 10000)}")
 
 # --- Бот ---
-bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
-dp = Dispatcher()
+from aiogram.client.default import DefaultBotProperties
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+dp = Dispatcher() 
 
 # --- База данных SQLite с оптимизацией ---
 DB_PATH = "shop.db"
