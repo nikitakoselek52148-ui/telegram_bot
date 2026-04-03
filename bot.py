@@ -293,15 +293,15 @@ async def send_product_carousel(message: types.Message, products, start_index=0)
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="◀️ Назад", callback_data=f"carousel_prev_{current}"),
+            InlineKeyboardButton(text="◀️", callback_data=f"carousel_prev_{current}"),
             InlineKeyboardButton(text=f"{current+1}/{total}", callback_data="carousel_info"),
-            InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"carousel_next_{current}")
+            InlineKeyboardButton(text="▶️", callback_data=f"carousel_next_{current}")
         ],
         [
-            InlineKeyboardButton(text="🛒 Добавить в корзину", callback_data=f"carousel_add_{product['id']}_{current}"),
+            InlineKeyboardButton(text="🛒 В корзину", callback_data=f"carousel_add_{product['id']}_{current}"),
             InlineKeyboardButton(text="❤️ В избранное", callback_data=f"carousel_wishlist_{product['id']}_{current}")
         ],
-        [InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_to_main")]
+        [InlineKeyboardButton(text="🔙 Главное меню", callback_data="back_to_main")]
     ])
     
     text = f"<b>{product['name']}</b>\n\n💰 Цена: {product['price']} ₽\n📝 {product['description']}"
@@ -338,8 +338,7 @@ def cart_keyboard():
 
 def order_confirmation_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Подтвердить", callback_data="confirm_order")],
-        [InlineKeyboardButton(text="❌ Отменить", callback_data="cart")]
+        [InlineKeyboardButton(text="✅ Да", callback_data="confirm_order"), InlineKeyboardButton(text="❌ Нет", callback_data="cart")]
     ])
 
 def update_status_keyboard(order_id, current_status):
@@ -359,7 +358,7 @@ async def start_command(message: types.Message):
     is_admin = user_id in ADMIN_IDS
     
     text = "🛍 <b>Добро пожаловать в магазин!</b>\n\n"
-    text += "• 📋 Посмотреть каталог\n• 🛒 Добавить товары в корзину\n• ✅ Оформить заказ\n• ❤️ Добавить товары в избранное"
+    text += "• 📋 Каталог\n• 🛒 Корзина\n• 📦 Мои заказы\n• ❤️ Избранное\n• 👤 Профиль"
     
     if is_admin:
         text += "\n\n🔐 <b>Вы вошли как администратор</b>"
@@ -436,10 +435,10 @@ async def handle_callback(callback: CallbackQuery):
         current = int(parts[3])
         if is_in_wishlist(user_id, product_id):
             remove_from_wishlist(user_id, product_id)
-            await callback.message.answer("🤍 Товар удалён из избранного!")
+            await callback.message.answer("🤍 Удалено из избранного")
         else:
             add_to_wishlist(user_id, product_id)
-            await callback.message.answer("❤️ Товар добавлен в избранное!")
+            await callback.message.answer("❤️ Добавлено в избранное")
         products = get_products()
         await send_product_carousel(callback.message, products, current)
         try:
@@ -473,9 +472,12 @@ async def handle_callback(callback: CallbackQuery):
         keyboard = InlineKeyboardMarkup(inline_keyboard=[])
         for item in cart:
             keyboard.inline_keyboard.append([
-                InlineKeyboardButton(text=f"➖ {item['name']}", callback_data=f"cart_decr_{item['product_id']}"),
-                InlineKeyboardButton(text=f"❌", callback_data=f"remove_from_cart_{item['product_id']}"),
+                InlineKeyboardButton(text=f"➖", callback_data=f"cart_decr_{item['product_id']}"),
+                InlineKeyboardButton(text=f"{item['name']}", callback_data="pass"),
                 InlineKeyboardButton(text=f"➕", callback_data=f"cart_incr_{item['product_id']}")
+            ])
+            keyboard.inline_keyboard.append([
+                InlineKeyboardButton(text=f"❌ Удалить", callback_data=f"remove_from_cart_{item['product_id']}")
             ])
         keyboard.inline_keyboard.append([InlineKeyboardButton(text="✅ Оформить заказ", callback_data="checkout")])
         keyboard.inline_keyboard.append([InlineKeyboardButton(text="🗑 Очистить корзину", callback_data="clear_cart")])
@@ -684,9 +686,12 @@ async def update_cart_message(callback: CallbackQuery, user_id: int, is_admin: b
     keyboard = InlineKeyboardMarkup(inline_keyboard=[])
     for item in cart:
         keyboard.inline_keyboard.append([
-            InlineKeyboardButton(text=f"➖ {item['name']}", callback_data=f"cart_decr_{item['product_id']}"),
-            InlineKeyboardButton(text=f"❌", callback_data=f"remove_from_cart_{item['product_id']}"),
+            InlineKeyboardButton(text=f"➖", callback_data=f"cart_decr_{item['product_id']}"),
+            InlineKeyboardButton(text=f"{item['name']}", callback_data="pass"),
             InlineKeyboardButton(text=f"➕", callback_data=f"cart_incr_{item['product_id']}")
+        ])
+        keyboard.inline_keyboard.append([
+            InlineKeyboardButton(text=f"❌ Удалить", callback_data=f"remove_from_cart_{item['product_id']}")
         ])
     keyboard.inline_keyboard.append([InlineKeyboardButton(text="✅ Оформить заказ", callback_data="checkout")])
     keyboard.inline_keyboard.append([InlineKeyboardButton(text="🗑 Очистить корзину", callback_data="clear_cart")])
@@ -736,7 +741,8 @@ async def handle_input(message: types.Message):
             await message.answer("❌ Введите номер заказа (цифрами)")
         return
     
-    await message.answer("🛍 Используйте кнопки для навигации.", reply_markup=main_menu_keyboard(is_admin))
+    # Игнорируем обычные сообщения (только кнопки)
+    pass
 
 # --- Настройка меню команд ---
 async def set_commands():
@@ -751,6 +757,7 @@ async def main():
     init_db()
     await set_commands()
     logger.info("🛍 БОТ-МАГАЗИН ЗАПУЩЕН")
+    logger.info(f"👑 Админ: {ADMIN_IDS}")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
