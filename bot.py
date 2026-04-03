@@ -715,4 +715,32 @@ async def update_cart_message(callback: CallbackQuery, user_id: int, is_admin: b
     
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
 
-@
+# --- Обработчики ---
+
+@dp.message(Command("start"))
+async def start_command(message: types.Message):
+    user_id = message.from_user.id
+    is_admin = user_id in ADMIN_IDS
+    
+    text = "🛍 <b>Добро пожаловать в магазин!</b>\n\n"
+    text += "• 📋 Посмотреть каталог\n• 🛒 Добавить товары в корзину\n• ✅ Оформить заказ\n• ❤️ Добавить товары в избранное"
+    
+    if is_admin:
+        text += "\n\n🔐 <b>Вы вошли как администратор</b>"
+    
+    await message.answer(text, reply_markup=main_menu_keyboard(is_admin), parse_mode="HTML")
+
+@dp.message(Command("catalog"))
+async def catalog_command(message: types.Message):
+    products = get_products()
+    logger.info(f"Команда catalog: получено {len(products)} товаров")
+    if not products:
+        await message.answer("📭 Каталог пуст. Добавьте товары через админ-панель.")
+        return
+    await send_product_carousel(message, products, 0)
+
+@dp.callback_query()
+async def handle_callback(callback: CallbackQuery):
+    # Весь твой основной обработчик callback уже есть
+    # Тут не нужно добавлять лишний '@'
+    pass
