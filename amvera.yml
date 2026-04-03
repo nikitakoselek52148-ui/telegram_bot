@@ -1,0 +1,17 @@
+meta:
+  environment: python
+  version: 3.11
+build:
+  requirementsPath: requirements.txt
+  pythonBin: python
+start:
+  cmd: python bot.py
+  env:
+    - name: TELEGRAM_TOKEN
+      value: ${TELEGRAM_TOKEN}
+    - name: ADMIN_IDS
+      value: 1912287053
+web:
+  healthcheck:
+    path: /
+    port: 10000
