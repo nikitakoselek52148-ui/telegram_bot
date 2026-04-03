@@ -1,8 +1,3 @@
-# 🚀 Улучшенная версия Telegram-бота магазина
-
-## 📋 **Основные улучшения**
-
-```python
 import asyncio
 import os
 import logging
@@ -15,13 +10,11 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, InputFile
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.exceptions import TelegramBadRequest
 from flask import Flask, send_file
 import aiosqlite
 from contextlib import asynccontextmanager
-import hashlib
-import re
 
 load_dotenv()
 
@@ -41,6 +34,11 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# --- Временные хранилища для состояний пользователей ---
+awaiting_product = set()        # Пользователи, которые добавляют товар
+awaiting_photo = {}             # {user_id: product_id} для добавления фото
+waiting_for_order_id = set()    # Пользователи, которые вводят номер заказа
 
 # --- Веб-сервер для Render с оптимизацией ---
 web_app = Flask(__name__)
@@ -64,7 +62,6 @@ def export_orders_csv():
         orders = cursor.fetchall()
         conn.close()
         
-        # Создаем CSV в памяти
         output = io.StringIO()
         writer = csv.writer(output)
         writer.writerow(['ID', 'User ID', 'Date', 'Total', 'Status', 'First Item'])
@@ -114,7 +111,7 @@ def run_web_server():
         host='0.0.0.0',
         port=port,
         threaded=True,
-        debug=False  # Отключаем debug для продакшена
+        debug=False
     )
 
 # Запуск веб-сервера в отдельном потоке
@@ -135,7 +132,6 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # Создание таблиц с индексами для производительности
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -195,14 +191,12 @@ def init_db():
         )
     ''')
     
-    # Создание индексов для ускорения запросов
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_carts_user_id ON carts(user_id)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_wishlist_user_id ON wishlist(user_id)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_products_category ON products(category)')
     
-    # Проверка существования тестовых данных
     cursor.execute("SELECT COUNT(*) FROM products WHERE is_active = 1")
     if cursor.fetchone()[0] == 0:
         test_products = [
@@ -278,7 +272,6 @@ def get_products(category=None, page=1, limit=10):
     cursor.execute(query, params)
     products = cursor.fetchall()
     
-    # Получаем общее количество для пагинации
     count_query = "SELECT COUNT(*) FROM products WHERE is_active = 1"
     if category and category != 'all':
         count_query += " AND category = ?"
@@ -313,7 +306,6 @@ def get_product(product_id):
 
 def add_product(name, price, description, category='other'):
     """Добавление товара с валидацией"""
-    # Валидация данных
     if not name or len(name.strip()) < 2:
         raise ValueError("Название товара слишком короткое")
     if price < 0:
@@ -335,18 +327,15 @@ def save_product_photo(product_id, file_id, file_path=None):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # Проверяем, есть ли уже главное фото
     cursor.execute("SELECT id FROM product_images WHERE product_id = ? AND is_main = 1", (product_id,))
     existing = cursor.fetchone()
     
     if existing:
-        # Обновляем существующее фото
         cursor.execute(
             "UPDATE product_images SET file_id = ?, file_path = ? WHERE id = ?",
             (file_id, file_path, existing[0])
         )
     else:
-        # Добавляем новое фото
         cursor.execute(
             "INSERT INTO product_images (product_id, file_id, file_path, is_main) VALUES (?, ?, ?, 1)",
             (product_id, file_id, file_path)
@@ -407,6 +396,17 @@ def clear_cart(user_id):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("DELETE FROM carts WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+def remove_from_cart(user_id, product_id):
+    """Удалить конкретный товар из корзины"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "DELETE FROM carts WHERE user_id = ? AND product_id = ?", 
+        (user_id, product_id)
+    )
     conn.commit()
     conn.close()
 
@@ -487,7 +487,6 @@ def get_stats(days=30):
     cursor.execute("SELECT COUNT(*) FROM products WHERE is_active = 1")
     products_count = cursor.fetchone()[0] or 0
     
-    # Статистика по дням
     cursor.execute("""
         SELECT date(substr(order_date, 7, 4) || '-' || 
                     substr(order_date, 4, 2) || '-' || 
@@ -513,7 +512,7 @@ def get_stats(days=30):
         'daily_stats': daily_stats
     }
 
-# --- Функции для избранного ---
+# --- Функции для работы с избранным ---
 def add_to_wishlist(user_id, product_id):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -594,7 +593,6 @@ def catalog_keyboard(category='all', page=1, total_pages=1):
     
     keyboard = []
     
-    # Кнопки категорий
     row = []
     for name, cat in categories:
         if cat == category:
@@ -607,7 +605,6 @@ def catalog_keyboard(category='all', page=1, total_pages=1):
     if row:
         keyboard.append(row)
     
-    # Кнопки пагинации
     pagination = []
     if page > 1:
         pagination.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"cat_{category}_{page-1}"))
@@ -625,7 +622,6 @@ def catalog_keyboard(category='all', page=1, total_pages=1):
 def product_card_keyboard(product_id, user_id, in_cart=False, in_wishlist=False):
     buttons = []
     
-    # Кнопки управления количеством
     if in_cart:
         buttons.append([
             InlineKeyboardButton(text="➖", callback_data=f"cart_decr_{product_id}"),
@@ -635,7 +631,6 @@ def product_card_keyboard(product_id, user_id, in_cart=False, in_wishlist=False)
     else:
         buttons.append([InlineKeyboardButton(text="🛒 Добавить в корзину", callback_data=f"add_to_cart_{product_id}")])
     
-    # Кнопка избранного
     if in_wishlist:
         buttons.append([InlineKeyboardButton(text="❤️ В избранном", callback_data=f"remove_wishlist_{product_id}")])
     else:
@@ -874,7 +869,7 @@ async def handle_callback(callback: CallbackQuery):
     try:
         await callback.answer()
         
-                if data == "back_to_main":
+        if data == "back_to_main":
             await callback.message.edit_text(
                 "🛍 <b>Главное меню</b>\n\nВыберите действие:",
                 reply_markup=main_menu_keyboard(is_admin)
@@ -890,7 +885,6 @@ async def handle_callback(callback: CallbackQuery):
             await show_catalog(callback.message, 'all', 1)
         
         elif data.startswith("cat_"):
-            # Обработка категорий и пагинации
             parts = data.split("_")
             category = parts[1]
             page = int(parts[2])
@@ -904,7 +898,6 @@ async def handle_callback(callback: CallbackQuery):
                 await callback.message.answer("❌ <b>Товар не найден</b>")
                 return
             
-            # Проверяем наличие в корзине и избранном
             cart = get_cart(user_id)
             in_cart = any(c['product_id'] == product_id for c in cart)
             in_wishlist = is_in_wishlist(user_id, product_id)
@@ -916,8 +909,7 @@ async def handle_callback(callback: CallbackQuery):
                 f"🏷 <b>Категория:</b> {product[4]}"
             )
             
-            # Если есть фото, отправляем его
-            if product[5]:  # file_id
+            if product[5]:
                 try:
                     await bot.send_photo(
                         chat_id=callback.message.chat.id,
@@ -1026,7 +1018,6 @@ async def handle_callback(callback: CallbackQuery):
                 reply_markup=main_menu_keyboard(is_admin)
             )
             
-            # Уведомление администраторов
             for admin_id in ADMIN_IDS:
                 try:
                     await bot.send_message(
@@ -1249,7 +1240,6 @@ async def handle_callback(callback: CallbackQuery):
                 f"✅ <b>Статус заказа #{order_id} изменён на {status_names.get(new_status, new_status)}</b>"
             )
             
-            # Уведомление пользователя
             order_info = None
             for order in get_all_orders():
                 if order['id'] == order_id:
@@ -1280,8 +1270,7 @@ async def handle_callback(callback: CallbackQuery):
                 "• other - 📦 Другое\n\n"
                 "Или отправьте /cancel для отмены"
             )
-            dp.awaiting_product = getattr(dp, "awaiting_product", set())
-            dp.awaiting_product.add(user_id)
+            awaiting_product.add(user_id)
         
         elif data == "admin_export" and is_admin:
             await callback.message.edit_text(
@@ -1291,29 +1280,27 @@ async def handle_callback(callback: CallbackQuery):
             )
         
         elif data == "export_orders" and is_admin:
+            render_url = os.environ.get('RENDER_EXTERNAL_URL', 'https://your-app.onrender.com')
             await callback.message.answer(
                 "📦 <b>Экспорт заказов</b>\n\n"
-                "Файл доступен по ссылке:\n"
-                f"https://{os.environ.get('RENDER_SERVICE', 'your-app')}.onrender.com/export/orders.csv\n\n"
-                "Или нажмите кнопку ниже:",
+                f"Ссылка для скачивания: {render_url}/export/orders.csv",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                     InlineKeyboardButton(
                         text="📥 Скачать CSV",
-                        url=f"https://{os.environ.get('RENDER_SERVICE', 'your-app')}.onrender.com/export/orders.csv"
+                        url=f"{render_url}/export/orders.csv"
                     )
                 ]])
             )
         
         elif data == "export_products" and is_admin:
+            render_url = os.environ.get('RENDER_EXTERNAL_URL', 'https://your-app.onrender.com')
             await callback.message.answer(
                 "🛒 <b>Экспорт товаров</b>\n\n"
-                "Файл доступен по ссылке:\n"
-                f"https://{os.environ.get('RENDER_SERVICE', 'your-app')}.onrender.com/export/products.csv\n\n"
-                "Или нажмите кнопку ниже:",
+                f"Ссылка для скачивания: {render_url}/export/products.csv",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                     InlineKeyboardButton(
                         text="📥 Скачать CSV",
-                        url=f"https://{os.environ.get('RENDER_SERVICE', 'your-app')}.onrender.com/export/products.csv"
+                        url=f"{render_url}/export/products.csv"
                     )
                 ]])
             )
@@ -1324,16 +1311,14 @@ async def handle_callback(callback: CallbackQuery):
                 "Введите номер заказа:",
                 reply_markup=admin_panel_keyboard()
             )
-            dp.waiting_for_order_id = getattr(dp, "waiting_for_order_id", set())
-            dp.waiting_for_order_id.add(user_id)
+            waiting_for_order_id.add(user_id)
         
         elif data == "noop":
-            # Пустое действие (для кнопок пагинации)
             pass
     
     except TelegramBadRequest as e:
         if "message is not modified" in str(e):
-            pass  # Игнорируем эту ошибку
+            pass
         else:
             logger.error(f"Telegram error: {e}")
     except Exception as e:
@@ -1341,17 +1326,18 @@ async def handle_callback(callback: CallbackQuery):
         await callback.message.answer("❌ <b>Произошла ошибка</b>\nПопробуйте еще раз.")
 
 # --- Обработчик текстовых сообщений ---
-[dp.message](workspace://dp.message)()
+@dp.message()
 async def handle_input(message: types.Message):
     user_id = message.from_user.id
     is_admin = user_id in ADMIN_IDS
     
-    # Обработка отмены
     if message.text and message.text.lower() == "/cancel":
-        if hasattr(dp, "awaiting_product") and user_id in dp.awaiting_product:
-            dp.awaiting_product.remove(user_id)
-        if hasattr(dp, "waiting_for_order_id") and user_id in dp.waiting_for_order_id:
-            dp.waiting_for_order_id.remove(user_id)
+        if user_id in awaiting_product:
+            awaiting_product.remove(user_id)
+        if user_id in waiting_for_order_id:
+            waiting_for_order_id.remove(user_id)
+        if user_id in awaiting_photo:
+            del awaiting_photo[user_id]
         
         await message.answer(
             "❌ <b>Действие отменено</b>",
@@ -1359,9 +1345,8 @@ async def handle_input(message: types.Message):
         )
         return
     
-    # Обработка добавления товара
-    if hasattr(dp, "awaiting_product") and user_id in dp.awaiting_product:
-        dp.awaiting_product.remove(user_id)
+    if user_id in awaiting_product:
+        awaiting_product.remove(user_id)
         
         try:
             parts = [p.strip() for p in message.text.split("|")]
@@ -1378,7 +1363,6 @@ async def handle_input(message: types.Message):
             desc = parts[2]
             category = parts[3] if len(parts) > 3 else 'other'
             
-            # Валидация категории
             valid_categories = ['footwear', 'clothing', 'accessories', 'other']
             if category not in valid_categories:
                 category = 'other'
@@ -1394,9 +1378,7 @@ async def handle_input(message: types.Message):
                 f"Теперь вы можете отправить фото товара (опционально)."
             )
             
-            # Запоминаем ID товара для добавления фото
-            dp.awaiting_photo = getattr(dp, "awaiting_photo", {})
-            dp.awaiting_photo[user_id] = product_id
+            awaiting_photo[user_id] = product_id
             
         except ValueError as e:
             await message.answer(f"❌ <b>Ошибка:</b> {str(e)}")
@@ -1410,19 +1392,17 @@ async def handle_input(message: types.Message):
         )
         return
     
-    # Обработка фото товара
-    if hasattr(dp, "awaiting_photo") and user_id in dp.awaiting_photo:
+    if user_id in awaiting_photo:
         if message.photo:
-            product_id = dp.awaiting_photo[user_id]
+            product_id = awaiting_photo[user_id]
             file_id = message.photo[-1].file_id
             
-            # Сохраняем фото
             save_product_photo(product_id, file_id)
             
             await message.answer(
                 f"✅ <b>Фото добавлено к товару #{product_id}</b>"
             )
-            del dp.awaiting_photo[user_id]
+            del awaiting_photo[user_id]
         else:
             await message.answer(
                 "❌ <b>Пожалуйста, отправьте фото</b>\n"
@@ -1430,9 +1410,8 @@ async def handle_input(message: types.Message):
             )
         return
     
-    # Обработка ввода номера заказа для изменения статуса
-    if hasattr(dp, "waiting_for_order_id") and user_id in dp.waiting_for_order_id:
-        dp.waiting_for_order_id.remove(user_id)
+    if user_id in waiting_for_order_id:
+        waiting_for_order_id.remove(user_id)
         
         try:
             order_id = int(message.text.strip())
@@ -1456,7 +1435,6 @@ async def handle_input(message: types.Message):
             await message.answer("❌ <b>Введите номер заказа (цифрами)</b>")
         return
     
-    # Обработка обычных сообщений
     await message.answer(
         "🛍 <b>Используйте кнопки для навигации</b>\n\n"
         "Или введите команду /help для справки",
@@ -1465,17 +1443,12 @@ async def handle_input(message: types.Message):
 
 # --- Основная функция ---
 async def main():
-    # Инициализация базы данных
     init_db()
-    
-    # Установка команд бота
     await set_commands()
     
     logger.info("🛍 БОТ-МАГАЗИН ЗАПУЩЕН")
     logger.info(f"📋 Администраторы: {ADMIN_IDS}")
-    logger.info("✅ Меню команд установлено")
     
-    # Запуск бота
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
