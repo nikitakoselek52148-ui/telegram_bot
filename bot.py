@@ -44,11 +44,9 @@ dp = Dispatcher()
 DB_PATH = "shop.db"
 
 def init_db():
-    """Инициализация базы данных с тестовыми товарами"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # Создаём таблицы
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -87,14 +85,8 @@ def init_db():
         )
     ''')
     
-    # Проверяем, есть ли товары
     cursor.execute("SELECT COUNT(*) FROM products")
-    count = cursor.fetchone()[0]
-    
-    logger.info(f"Найдено товаров в БД: {count}")
-    
-    # Если товаров нет — добавляем тестовые
-    if count == 0:
+    if cursor.fetchone()[0] == 0:
         test_products = [
             ("Кроссовки Nike Air", 8900, "Спортивные кроссовки, размер 40-45", None),
             ("Футболка Adidas", 2500, "Хлопковая футболка, размеры S-XXL", None),
@@ -105,28 +97,18 @@ def init_db():
             "INSERT INTO products (name, price, description, photo) VALUES (?, ?, ?, ?)",
             test_products
         )
-        logger.info("✅ Добавлены тестовые товары")
     
     conn.commit()
-    
-    # Проверяем, что товары действительно добавились
-    cursor.execute("SELECT COUNT(*) FROM products")
-    final_count = cursor.fetchone()[0]
-    logger.info(f"После инициализации товаров: {final_count}")
-    
     conn.close()
     logger.info("База данных инициализирована")
 
 def get_products():
-    """Получить все товары"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT id, name, price, description, photo FROM products")
     products = cursor.fetchall()
     conn.close()
-    result = [{'id': p[0], 'name': p[1], 'price': p[2], 'description': p[3], 'photo': p[4]} for p in products]
-    logger.info(f"get_products вернул {len(result)} товаров")
-    return result
+    return [{'id': p[0], 'name': p[1], 'price': p[2], 'description': p[3], 'photo': p[4]} for p in products]
 
 def get_product(product_id):
     conn = sqlite3.connect(DB_PATH)
@@ -387,9 +369,8 @@ async def start_command(message: types.Message):
 @dp.message(Command("catalog"))
 async def catalog_command(message: types.Message):
     products = get_products()
-    logger.info(f"Команда catalog: получено {len(products)} товаров")
     if not products:
-        await message.answer("📭 Каталог пуст. Добавьте товары через админ-панель.")
+        await message.answer("📭 Каталог пуст")
         return
     await send_product_carousel(message, products, 0)
 
@@ -403,16 +384,14 @@ async def handle_callback(callback: CallbackQuery):
     # --- Карусель ---
     if data == "catalog":
         products = get_products()
-        logger.info(f"Callback catalog: получено {len(products)} товаров")
         if not products:
-            await callback.message.edit_text("📭 Каталог пуст. Добавьте товары через админ-панель.")
+            await callback.message.edit_text("📭 Каталог пуст")
             return
         await send_product_carousel(callback.message, products, 0)
-        if hasattr(callback.message, 'delete'):
-            try:
-                await callback.message.delete()
-            except:
-                pass
+        try:
+            await callback.message.delete()
+        except:
+            pass
         return
     
     if data.startswith("carousel_prev_"):
@@ -611,7 +590,7 @@ async def handle_callback(callback: CallbackQuery):
     elif data == "admin_products" and is_admin:
         products = get_products()
         if not products:
-            await callback.message.edit_text("📭 <b>Нет товаров</b>\n\nИспользуйте кнопку «➕ Добавить товар»", reply_markup=admin_panel_keyboard(), parse_mode="HTML")
+            await callback.message.edit_text("📭 <b>Нет товаров</b>", reply_markup=admin_panel_keyboard(), parse_mode="HTML")
             return
         text = "📋 <b>Управление товарами</b>\n\n"
         keyboard = InlineKeyboardMarkup(inline_keyboard=[])
@@ -715,32 +694,64 @@ async def update_cart_message(callback: CallbackQuery, user_id: int, is_admin: b
     
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
 
-# --- Обработчики ---
-
-@dp.message(Command("start"))
-async def start_command(message: types.Message):
+@dp.message()
+async def handle_input(message: types.Message):
     user_id = message.from_user.id
     is_admin = user_id in ADMIN_IDS
     
-    text = "🛍 <b>Добро пожаловать в магазин!</b>\n\n"
-    text += "• 📋 Посмотреть каталог\n• 🛒 Добавить товары в корзину\n• ✅ Оформить заказ\n• ❤️ Добавить товары в избранное"
-    
-    if is_admin:
-        text += "\n\n🔐 <b>Вы вошли как администратор</b>"
-    
-    await message.answer(text, reply_markup=main_menu_keyboard(is_admin), parse_mode="HTML")
-
-@dp.message(Command("catalog"))
-async def catalog_command(message: types.Message):
-    products = get_products()
-    logger.info(f"Команда catalog: получено {len(products)} товаров")
-    if not products:
-        await message.answer("📭 Каталог пуст. Добавьте товары через админ-панель.")
+    # Добавление товара
+    if hasattr(dp, "awaiting_product") and user_id in dp.awaiting_product:
+        dp.awaiting_product.remove(user_id)
+        try:
+            parts = message.text.split("|")
+            if len(parts) >= 3:
+                name = parts[0].strip()
+                price = int(parts[1].strip())
+                desc = parts[2].strip()
+                product_id = add_product(name, price, desc)
+                await message.answer(f"✅ Товар «{name}» добавлен! ID: {product_id}")
+            else:
+                await message.answer("❌ Неверный формат. Используйте: <code>Название | Цена | Описание</code>", parse_mode="HTML")
+        except ValueError:
+            await message.answer("❌ Цена должна быть числом")
+        except Exception as e:
+            await message.answer(f"❌ Ошибка: {e}")
         return
-    await send_product_carousel(message, products, 0)
+    
+    # Изменение статуса заказа
+    if hasattr(dp, "waiting_for_order_id") and user_id in dp.waiting_for_order_id:
+        dp.waiting_for_order_id.remove(user_id)
+        try:
+            order_id = int(message.text.strip())
+            current_status = None
+            for order in get_all_orders():
+                if order['id'] == order_id:
+                    current_status = order['status']
+                    break
+            if current_status:
+                await message.answer(f"🔄 <b>Заказ #{order_id}</b>\n\nТекущий статус: {current_status}\n\nВыберите новый статус:", reply_markup=update_status_keyboard(order_id, current_status), parse_mode="HTML")
+            else:
+                await message.answer(f"❌ Заказ #{order_id} не найден")
+        except ValueError:
+            await message.answer("❌ Введите номер заказа (цифрами)")
+        return
+    
+    await message.answer("🛍 Используйте кнопки для навигации.", reply_markup=main_menu_keyboard(is_admin))
 
-@dp.callback_query()
-async def handle_callback(callback: CallbackQuery):
-    # Весь твой основной обработчик callback уже есть
-    # Тут не нужно добавлять лишний '@'
-    pass
+# --- Настройка меню команд ---
+async def set_commands():
+    commands = [
+        types.BotCommand(command="start", description="🛍 Главное меню"),
+        types.BotCommand(command="catalog", description="📋 Каталог товаров"),
+    ]
+    await bot.set_my_commands(commands)
+    logger.info("✅ Меню команд установлено")
+
+async def main():
+    init_db()
+    await set_commands()
+    logger.info("🛍 БОТ-МАГАЗИН ЗАПУЩЕН")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
