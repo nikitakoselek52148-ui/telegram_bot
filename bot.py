@@ -8,7 +8,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.client.default import DefaultBotProperties
 from flask import Flask
 
@@ -46,6 +46,18 @@ DB_PATH = "shop.db"
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+    
+    # Таблица пользователей с телефоном
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            phone TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            username TEXT,
+            registered_at TEXT
+        )
+    ''')
     
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS products (
@@ -85,6 +97,7 @@ def init_db():
         )
     ''')
     
+    # Добавляем тестовые товары
     cursor.execute("SELECT COUNT(*) FROM products")
     if cursor.fetchone()[0] == 0:
         test_products = [
@@ -102,6 +115,43 @@ def init_db():
     conn.close()
     logger.info("База данных инициализирована")
 
+# --- Функции работы с пользователями ---
+def register_user(user_id: int, phone: str = None, first_name: str = None, last_name: str = None, username: str = None):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+    existing = cursor.fetchone()
+    
+    if existing:
+        if phone:
+            cursor.execute("UPDATE users SET phone = ? WHERE user_id = ?", (phone, user_id))
+    else:
+        cursor.execute('''
+            INSERT INTO users (user_id, phone, first_name, last_name, username, registered_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (user_id, phone, first_name, last_name, username, datetime.now().strftime("%d.%m.%Y %H:%M")))
+    
+    conn.commit()
+    conn.close()
+
+def get_user_phone(user_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT phone FROM users WHERE user_id = ?", (user_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return result[0] if result else None
+
+def is_user_registered(user_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return result is not None
+
+# --- Функции работы с БД ---
 def get_products():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -281,6 +331,18 @@ def is_in_wishlist(user_id, product_id):
     conn.close()
     return result is not None
 
+# --- Клавиатура для ввода номера ---
+def get_phone_keyboard():
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📱 Отправить номер телефона", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+    return keyboard
+
+def remove_keyboard():
+    return ReplyKeyboardMarkup(keyboard=[], resize_keyboard=True)
+
 # --- Карусель товаров ---
 async def send_product_carousel(message: types.Message, products, start_index=0):
     if not products:
@@ -356,6 +418,60 @@ def update_status_keyboard(order_id, current_status):
 async def start_command(message: types.Message):
     user_id = message.from_user.id
     is_admin = user_id in ADMIN_IDS
+    
+    # Проверяем, зарегистрирован ли пользователь
+    if not is_user_registered(user_id):
+        # Регистрируем с базовой информацией
+        register_user(
+            user_id=user_id,
+            first_name=message.from_user.first_name,
+            last_name=message.from_user.last_name,
+            username=message.from_user.username
+        )
+        
+        # Просим номер телефона
+        await message.answer(
+            "🛍 <b>Добро пожаловать в магазин!</b>\n\n"
+            "Для оформления заказов нам нужен ваш номер телефона.\n"
+            "Нажмите на кнопку ниже, чтобы поделиться номером.",
+            reply_markup=get_phone_keyboard(),
+            parse_mode="HTML"
+        )
+        return
+    
+    # Если пользователь уже зарегистрирован
+    phone = get_user_phone(user_id)
+    text = "🛍 <b>Добро пожаловать в магазин!</b>\n\n"
+    if phone:
+        text += f"📱 Ваш номер: {phone}\n\n"
+    text += "• 📋 Каталог\n• 🛒 Корзина\n• 📦 Мои заказы\n• ❤️ Избранное\n• 👤 Профиль"
+    
+    if is_admin:
+        text += "\n\n🔐 <b>Вы вошли как администратор</b>"
+    
+    await message.answer(text, reply_markup=main_menu_keyboard(is_admin), parse_mode="HTML")
+
+@dp.message(lambda msg: msg.contact is not None)
+async def handle_contact(message: types.Message):
+    user_id = message.from_user.id
+    phone = message.contact.phone_number
+    
+    # Обновляем номер телефона пользователя
+    register_user(
+        user_id=user_id,
+        phone=phone,
+        first_name=message.from_user.first_name,
+        last_name=message.from_user.last_name,
+        username=message.from_user.username
+    )
+    
+    is_admin = user_id in ADMIN_IDS
+    
+    await message.answer(
+        f"✅ <b>Номер телефона сохранён!</b>\n\n📱 Ваш номер: {phone}\n\nТеперь вы можете оформлять заказы.",
+        reply_markup=remove_keyboard(),
+        parse_mode="HTML"
+    )
     
     text = "🛍 <b>Добро пожаловать в магазин!</b>\n\n"
     text += "• 📋 Каталог\n• 🛒 Корзина\n• 📦 Мои заказы\n• ❤️ Избранное\n• 👤 Профиль"
@@ -510,6 +626,16 @@ async def handle_callback(callback: CallbackQuery):
         await callback.message.edit_text("🛒 <b>Корзина очищена</b>", reply_markup=main_menu_keyboard(is_admin), parse_mode="HTML")
     
     elif data == "checkout":
+        # Проверяем, есть ли номер телефона
+        phone = get_user_phone(user_id)
+        if not phone:
+            await callback.message.answer(
+                "❌ <b>Для оформления заказа нужен номер телефона!</b>\n\n"
+                "Пожалуйста, отправьте команду /start и поделитесь номером.",
+                parse_mode="HTML"
+            )
+            return
+        
         cart = get_cart(user_id)
         if not cart:
             await callback.message.answer("🛒 Корзина пуста")
@@ -522,7 +648,7 @@ async def handle_callback(callback: CallbackQuery):
             total += subtotal
             items_text += f"• {item['name']} x{item['quantity']} = {subtotal} ₽\n"
         
-        text = f"📦 <b>Подтверждение заказа</b>\n\n{items_text}\n<b>Итого: {total} ₽</b>"
+        text = f"📦 <b>Подтверждение заказа</b>\n\n{items_text}\n<b>Итого: {total} ₽</b>\n\n📱 Номер для связи: {phone}"
         await callback.message.edit_text(text, reply_markup=order_confirmation_keyboard(), parse_mode="HTML")
     
     elif data == "confirm_order":
@@ -566,7 +692,8 @@ async def handle_callback(callback: CallbackQuery):
     elif data == "profile":
         orders = get_user_orders(user_id)
         total_spent = sum(o['total'] for o in orders)
-        text = f"👤 <b>Ваш профиль</b>\n\n🆔 ID: {user_id}\n📦 Заказов: {len(orders)}\n💰 Потрачено: {total_spent} ₽\n🛒 Товаров в корзине: {len(get_cart(user_id))}\n❤️ В избранном: {len(get_wishlist(user_id))}"
+        phone = get_user_phone(user_id) or "Не указан"
+        text = f"👤 <b>Ваш профиль</b>\n\n🆔 ID: {user_id}\n📱 Телефон: {phone}\n📦 Заказов: {len(orders)}\n💰 Потрачено: {total_spent} ₽\n🛒 Товаров в корзине: {len(get_cart(user_id))}\n❤️ В избранном: {len(get_wishlist(user_id))}"
         await callback.message.edit_text(text, reply_markup=main_menu_keyboard(is_admin), parse_mode="HTML")
     
     # --- Избранное ---
@@ -741,7 +868,7 @@ async def handle_input(message: types.Message):
             await message.answer("❌ Введите номер заказа (цифрами)")
         return
     
-    # Игнорируем обычные сообщения (только кнопки)
+    # Обычное сообщение (игнорируем)
     pass
 
 # --- Настройка меню команд ---
@@ -756,8 +883,7 @@ async def set_commands():
 async def main():
     init_db()
     await set_commands()
-    logger.info("🛍 БОТ-МАГАЗИН ЗАПУЩЕН")
-    logger.info(f"👑 Админ: {ADMIN_IDS}")
+    logger.info("🛍 БОТ-МАГАЗИН ЗАПУЩЕН с верификацией")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
