@@ -4,8 +4,8 @@ import logging
 import sqlite3
 import threading
 import json
-import uuid
-from datetime import datetime, timedelta
+import aiohttp
+from datetime import datetime
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -17,6 +17,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 ADMIN_IDS = [1912287053]
+GOOGLE_SHEETS_URL = os.getenv("GOOGLE_SHEETS_URL")
 
 if not BOT_TOKEN:
     raise ValueError("Токен не найден!")
@@ -41,10 +42,6 @@ web_thread.start()
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
-# --- Хранилище для верификации (временное, в памяти) ---
-# В продакшене лучше хранить в БД
-pending_verifications = {}  # token -> {"phone": "+7...", "expires": datetime, "user_id": int}
-
 # --- База данных SQLite ---
 DB_PATH = "shop.db"
 
@@ -52,7 +49,6 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # Таблица пользователей (добавлено поле phone_verified)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -67,7 +63,7 @@ def init_db():
     
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             name TEXT NOT NULL,
             price INTEGER NOT NULL,
             description TEXT,
@@ -103,41 +99,105 @@ def init_db():
         )
     ''')
     
-    # Добавляем тестовые товары с фото
-    cursor.execute("SELECT COUNT(*) FROM products")
-    if cursor.fetchone()[0] == 0:
-        test_products = [
-            ("Кроссовки Nike Air", 8900, "Спортивные кроссовки, размер 40-45", None),
-            ("Футболка Adidas", 2500, "Хлопковая футболка, размеры S-XXL", None),
-            ("Кепка New Era", 1800, "Бейсболка, регулируемая", None),
-            ("Рюкзак Puma", 4200, "Вместительный рюкзак для города", None),
-        ]
-        cursor.executemany(
-            "INSERT INTO products (name, price, description, photo) VALUES (?, ?, ?, ?)",
-            test_products
-        )
-    
     conn.commit()
     conn.close()
     logger.info("База данных инициализирована")
 
-# --- Функции работы с пользователями ---
+# --- Функция загрузки товаров из Google Sheets ---
+async def load_products_from_google_sheets():
+    """Загружает товары из Google Sheets и обновляет БД"""
+    if not GOOGLE_SHEETS_URL:
+        logger.warning("GOOGLE_SHEETS_URL не задан, используем локальные товары")
+        return False
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(GOOGLE_SHEETS_URL, timeout=30) as response:
+                if response.status != 200:
+                    logger.error(f"Ошибка загрузки Google Sheets: {response.status}")
+                    return False
+                
+                csv_text = await response.text()
+                lines = csv_text.strip().split('\n')
+                
+                if len(lines) < 2:
+                    logger.warning("Google Sheets пуст")
+                    return False
+                
+                # Парсим CSV (простой способ)
+                products = []
+                headers = [h.strip().lower() for h in lines[0].split(',')]
+                
+                # Находим индексы колонок
+                id_idx = headers.index('id') if 'id' in headers else 0
+                name_idx = headers.index('name') if 'name' in headers else 1
+                price_idx = headers.index('price') if 'price' in headers else 2
+                desc_idx = headers.index('description') if 'description' in headers else 3
+                photo_idx = headers.index('photo') if 'photo' in headers else 4
+                
+                for line in lines[1:]:
+                    parts = [p.strip() for p in line.split(',')]
+                    if len(parts) < 4:
+                        continue
+                    
+                    try:
+                        product_id = int(parts[id_idx]) if parts[id_idx].isdigit() else None
+                        name = parts[name_idx] if len(parts) > name_idx else ""
+                        price = int(parts[price_idx]) if len(parts) > price_idx and parts[price_idx].isdigit() else 0
+                        description = parts[desc_idx] if len(parts) > desc_idx else ""
+                        photo = parts[photo_idx] if len(parts) > photo_idx and parts[photo_idx] else None
+                        
+                        if product_id and name and price > 0:
+                            products.append({
+                                'id': product_id,
+                                'name': name,
+                                'price': price,
+                                'description': description,
+                                'photo': photo
+                            })
+                    except Exception as e:
+                        logger.error(f"Ошибка парсинга строки: {e}")
+                        continue
+                
+                if products:
+                    # Обновляем БД
+                    conn = sqlite3.connect(DB_PATH)
+                    cursor = conn.cursor()
+                    
+                    # Очищаем старые товары
+                    cursor.execute("DELETE FROM products")
+                    
+                    # Добавляем новые
+                    for p in products:
+                        cursor.execute('''
+                            INSERT INTO products (id, name, price, description, photo)
+                            VALUES (?, ?, ?, ?, ?)
+                        ''', (p['id'], p['name'], p['price'], p['description'], p['photo']))
+                    
+                    conn.commit()
+                    conn.close()
+                    
+                    logger.info(f"Загружено {len(products)} товаров из Google Sheets")
+                    return True
+                else:
+                    logger.warning("Нет валидных товаров в Google Sheets")
+                    return False
+                    
+    except Exception as e:
+        logger.error(f"Ошибка загрузки Google Sheets: {e}")
+        return False
 
+# --- Функции работы с пользователями ---
 def register_user(user_id: int, first_name: str = None, last_name: str = None, username: str = None, phone: str = None, verified: bool = False):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # Проверяем, существует ли пользователь
     cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
     existing = cursor.fetchone()
     
     if existing:
-        # Обновляем только новые данные
         if phone:
             cursor.execute("UPDATE users SET phone = ?, phone_verified = ? WHERE user_id = ?", (phone, 1 if verified else 0, user_id))
-        else:
-            cursor.execute("UPDATE users SET first_name = ?, last_name = ?, username = ? WHERE user_id = ?", 
-                          (first_name, last_name, username, user_id))
     else:
         cursor.execute('''
             INSERT INTO users (user_id, phone, phone_verified, first_name, last_name, username, registered_at)
@@ -171,12 +231,11 @@ def is_phone_verified(user_id: int):
     conn.close()
     return result[0] == 1 if result else False
 
-# --- Функции работы с БД ---
-
+# --- Функции работы с БД (товары из Google Sheets) ---
 def get_products():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT id, name, price, description, photo FROM products")
+    cursor.execute("SELECT id, name, price, description, photo FROM products ORDER BY id")
     products = cursor.fetchall()
     conn.close()
     return [{'id': p[0], 'name': p[1], 'price': p[2], 'description': p[3], 'photo': p[4]} for p in products]
@@ -190,27 +249,6 @@ def get_product(product_id):
     if product:
         return {'id': product[0], 'name': product[1], 'price': product[2], 'description': product[3], 'photo': product[4]}
     return None
-
-def add_product(name, price, description, photo=None):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO products (name, price, description, photo) VALUES (?, ?, ?, ?)",
-        (name, price, description, photo)
-    )
-    conn.commit()
-    product_id = cursor.lastrowid
-    conn.close()
-    return product_id
-
-def delete_product(product_id):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM products WHERE id = ?", (product_id,))
-    cursor.execute("DELETE FROM carts WHERE product_id = ?", (product_id,))
-    cursor.execute("DELETE FROM wishlist WHERE product_id = ?", (product_id,))
-    conn.commit()
-    conn.close()
 
 def get_cart(user_id):
     conn = sqlite3.connect(DB_PATH)
@@ -355,9 +393,7 @@ def is_in_wishlist(user_id, product_id):
 # --- Клавиатура для ввода номера ---
 def get_phone_keyboard():
     keyboard = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📱 Отправить номер телефона", request_contact=True)]
-        ],
+        keyboard=[[KeyboardButton(text="📱 Отправить номер телефона", request_contact=True)]],
         resize_keyboard=True,
         one_time_keyboard=True
     )
@@ -368,7 +404,6 @@ def remove_keyboard():
 
 # --- Карусель товаров ---
 async def send_product_carousel(message: types.Message, products, start_index=0):
-    """Отправляет товары в виде карусели (альбом с кнопками)"""
     if not products:
         await message.answer("📭 Каталог пуст")
         return
@@ -387,9 +422,7 @@ async def send_product_carousel(message: types.Message, products, start_index=0)
             InlineKeyboardButton(text="🛒 Добавить в корзину", callback_data=f"carousel_add_{product['id']}_{current}"),
             InlineKeyboardButton(text="❤️ В избранное", callback_data=f"carousel_wishlist_{product['id']}_{current}")
         ],
-        [
-            InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_to_main")
-        ]
+        [InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_to_main")]
     ])
     
     text = f"<b>{product['name']}</b>\n\n💰 Цена: {product['price']} ₽\n📝 {product['description']}"
@@ -412,7 +445,7 @@ def main_menu_keyboard(is_admin=False):
 
 def admin_panel_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats"), InlineKeyboardButton(text="➕ Добавить товар", callback_data="admin_add_product")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats"), InlineKeyboardButton(text="🔄 Обновить товары", callback_data="admin_sync")],
         [InlineKeyboardButton(text="📋 Товары", callback_data="admin_products"), InlineKeyboardButton(text="📦 Заказы", callback_data="admin_orders")],
         [InlineKeyboardButton(text="🔄 Статусы заказов", callback_data="admin_update_status"), InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
     ])
@@ -441,10 +474,17 @@ def update_status_keyboard(order_id, current_status):
 
 # --- Обработчики ---
 
+# Глобальная переменная для хранения токенов верификации (в памяти)
+pending_verifications = {}
+
 @dp.message(Command("start"))
 async def start_command(message: types.Message):
     user_id = message.from_user.id
     is_admin = user_id in ADMIN_IDS
+    
+    # Загружаем товары из Google Sheets при старте
+    if GOOGLE_SHEETS_URL:
+        await load_products_from_google_sheets()
     
     # Проверяем, есть ли параметр верификации
     args = message.text.split()
@@ -454,47 +494,19 @@ async def start_command(message: types.Message):
             verif = pending_verifications[token]
             if verif["expires"] > datetime.now():
                 phone = verif["phone"]
-                # Сохраняем подтверждённый номер
-                register_user(
-                    user_id=user_id,
-                    first_name=message.from_user.first_name,
-                    last_name=message.from_user.last_name,
-                    username=message.from_user.username,
-                    phone=phone,
-                    verified=True
-                )
-                # Удаляем токен
+                register_user(user_id=user_id, phone=phone, verified=True)
                 del pending_verifications[token]
-                
-                await message.answer(
-                    f"✅ <b>Номер телефона подтверждён!</b>\n\n📱 Ваш номер: {phone}\n\nДобро пожаловать в магазин!",
-                    reply_markup=remove_keyboard()
-                )
-                
-                text = "🛍 <b>Добро пожаловать в магазин!</b>\n\n"
-                text += "• 📋 Посмотреть каталог\n• 🛒 Добавить товары в корзину\n• ✅ Оформить заказ\n• ❤️ Добавить товары в избранное"
-                if is_admin:
-                    text += "\n\n🔐 <b>Вы вошли как администратор</b>"
-                
-                await message.answer(text, reply_markup=main_menu_keyboard(is_admin), parse_mode="HTML")
+                await message.answer(f"✅ <b>Номер телефона подтверждён!</b>\n\n📱 Ваш номер: {phone}", reply_markup=remove_keyboard())
             else:
-                await message.answer("❌ Срок действия ссылки истёк. Пожалуйста, запросите подтверждение заново командой /verify")
+                await message.answer("❌ Срок действия ссылки истёк.")
                 del pending_verifications[token]
         else:
-            await message.answer("❌ Неверный код подтверждения. Пожалуйста, запросите подтверждение заново командой /verify")
+            await message.answer("❌ Неверный код подтверждения.")
         return
     
     # Обычный /start
     if not is_user_registered(user_id):
-        # Регистрируем с базовой информацией
-        register_user(
-            user_id=user_id,
-            first_name=message.from_user.first_name,
-            last_name=message.from_user.last_name,
-            username=message.from_user.username
-        )
-        
-        # Предлагаем подтвердить номер
+        register_user(user_id=user_id, first_name=message.from_user.first_name, last_name=message.from_user.last_name, username=message.from_user.username)
         await message.answer(
             "🛍 <b>Добро пожаловать в магазин!</b>\n\n"
             "Для вашей безопасности и связи с вами, мы должны подтвердить ваш номер телефона.\n\n"
@@ -510,8 +522,7 @@ async def start_command(message: types.Message):
         if verified:
             text += f"✅ Номер подтверждён: {phone}\n\n"
         else:
-            text += f"📱 Ваш номер: {phone} (не подтверждён)\n"
-            text += "⚠️ Для оформления заказов необходимо подтвердить номер командой /verify\n\n"
+            text += f"📱 Ваш номер: {phone} (не подтверждён)\n⚠️ Для оформления заказов необходимо подтвердить номер командой /verify\n\n"
     else:
         text += "📱 Для оформления заказов необходимо подтвердить номер командой /verify\n\n"
     
@@ -525,8 +536,6 @@ async def start_command(message: types.Message):
 @dp.message(Command("verify"))
 async def verify_command(message: types.Message):
     user_id = message.from_user.id
-    
-    # Проверяем, есть ли уже подтверждённый номер
     phone, verified = get_user_phone(user_id)
     if verified:
         await message.answer(f"✅ Ваш номер {phone} уже подтверждён!")
@@ -548,17 +557,14 @@ async def handle_phone_input(message: types.Message):
     dp.waiting_for_phone.remove(user_id)
     
     phone = message.text.strip()
-    
-    # Простая валидация номера
     if not phone.startswith("+") or len(phone) < 10:
         await message.answer("❌ Неверный формат. Используйте: <code>+79123456789</code>", parse_mode="HTML")
         return
     
-    # Генерируем токен
+    import uuid
     token = str(uuid.uuid4())[:8]
     bot_username = (await bot.get_me()).username
     
-    # Сохраняем в временное хранилище
     pending_verifications[token] = {
         "phone": phone,
         "expires": datetime.now() + timedelta(minutes=5),
@@ -570,8 +576,7 @@ async def handle_phone_input(message: types.Message):
     await message.answer(
         f"📱 <b>Код подтверждения отправлен!</b>\n\n"
         f"👉 <a href='{verification_link}'>Нажмите сюда, чтобы подтвердить номер {phone}</a>\n\n"
-        f"⚠️ Ссылка действительна 5 минут.\n\n"
-        f"Если ссылка не открывается, скопируйте её в браузер:\n<code>{verification_link}</code>",
+        f"⚠️ Ссылка действительна 5 минут.",
         parse_mode="HTML",
         disable_web_page_preview=True
     )
@@ -590,6 +595,17 @@ async def handle_callback(callback: CallbackQuery):
     data = callback.data
     is_admin = user_id in ADMIN_IDS
     await callback.answer()
+    
+    # --- Админ: синхронизация с Google Sheets ---
+    if data == "admin_sync" and is_admin:
+        await callback.message.edit_text("🔄 <b>Синхронизация товаров с Google Sheets...</b>", parse_mode="HTML")
+        success = await load_products_from_google_sheets()
+        if success:
+            await callback.message.answer("✅ <b>Товары успешно обновлены из Google Sheets!</b>", parse_mode="HTML")
+        else:
+            await callback.message.answer("❌ <b>Ошибка синхронизации.</b>\nПроверьте ссылку на Google Sheets.", parse_mode="HTML")
+        await callback.message.edit_text("🔐 <b>Панель администратора</b>", reply_markup=admin_panel_keyboard(), parse_mode="HTML")
+        return
     
     # --- Карусель ---
     if data.startswith("catalog"):
@@ -733,15 +749,9 @@ async def handle_callback(callback: CallbackQuery):
         await callback.message.edit_text("🛒 <b>Корзина очищена</b>", reply_markup=main_menu_keyboard(is_admin), parse_mode="HTML")
     
     elif data == "checkout":
-        # Проверяем, подтверждён ли номер
         _, verified = get_user_phone(user_id)
         if not verified:
-            await callback.message.answer(
-                "❌ <b>Номер телефона не подтверждён!</b>\n\n"
-                "Для оформления заказа необходимо подтвердить номер.\n"
-                "Используйте команду /verify",
-                parse_mode="HTML"
-            )
+            await callback.message.answer("❌ <b>Номер телефона не подтверждён!</b>\n\nИспользуйте команду /verify", parse_mode="HTML")
             return
         
         cart = get_cart(user_id)
@@ -833,22 +843,11 @@ async def handle_callback(callback: CallbackQuery):
         if not products:
             await callback.message.edit_text("📭 <b>Нет товаров</b>", reply_markup=admin_panel_keyboard(), parse_mode="HTML")
             return
-        text = "📋 <b>Управление товарами</b>\n\n"
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+        text = "📋 <b>Текущие товары (из Google Sheets)</b>\n\n"
         for p in products:
             text += f"• {p['name']} - {p['price']} ₽\n"
-            keyboard.inline_keyboard.append([InlineKeyboardButton(text=f"❌ Удалить {p['name']}", callback_data=f"admin_delete_product_{p['id']}")])
-        keyboard.inline_keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel")])
-        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
-    
-    elif data.startswith("admin_delete_product_") and is_admin:
-        product_id = int(data.split("_")[3])
-        product = get_product(product_id)
-        if product:
-            delete_product(product_id)
-            await callback.message.answer(f"✅ Товар «{product['name']}» удалён")
-        else:
-            await callback.message.answer("❌ Товар не найден")
+        text += "\n📝 <b>Для изменения товаров:</b>\nОтредактируйте Google Таблицу и нажмите «🔄 Обновить товары»"
+        await callback.message.edit_text(text, reply_markup=admin_panel_keyboard(), parse_mode="HTML")
     
     elif data == "admin_orders" and is_admin:
         all_orders = get_all_orders()
@@ -892,14 +891,6 @@ async def handle_callback(callback: CallbackQuery):
             except:
                 pass
     
-    elif data == "admin_add_product" and is_admin:
-        await callback.message.edit_text(
-            "📝 <b>Добавление товара</b>\n\nОтправьте данные в формате:\n<code>Название | Цена | Описание</code>\n\nПример:\n<code>Кроссовки Nike | 8900 | Спортивные кроссовки</code>",
-            parse_mode="HTML"
-        )
-        dp.awaiting_product = getattr(dp, "awaiting_product", set())
-        dp.awaiting_product.add(user_id)
-    
     elif data == "admin_update_status" and is_admin:
         await callback.message.edit_text(
             "🔄 <b>Изменение статуса заказа</b>\n\nВведите номер заказа:",
@@ -940,56 +931,6 @@ async def handle_input(message: types.Message):
     user_id = message.from_user.id
     is_admin = user_id in ADMIN_IDS
     
-    # Добавление товара
-    if hasattr(dp, "awaiting_product") and user_id in dp.awaiting_product:
-        dp.awaiting_product.remove(user_id)
-        try:
-            parts = message.text.split("|")
-            if len(parts) >= 3:
-                name = parts[0].strip()
-                price = int(parts[1].strip())
-                desc = parts[2].strip()
-                product_id = add_product(name, price, desc)
-                await message.answer(f"✅ Товар «{name}» добавлен! ID: {product_id}")
-                
-                # Предлагаем добавить фото
-                await message.answer("📸 Хотите добавить фото товара? Отправьте фото сейчас или нажмите /skip")
-                dp.waiting_for_photo = getattr(dp, "waiting_for_photo", set())
-                dp.waiting_for_photo.add((user_id, product_id))
-            else:
-                await message.answer("❌ Неверный формат. Используйте: <code>Название | Цена | Описание</code>", parse_mode="HTML")
-        except ValueError:
-            await message.answer("❌ Цена должна быть числом")
-        except Exception as e:
-            await message.answer(f"❌ Ошибка: {e}")
-        return
-    
-    # Пропуск фото
-    if message.text == "/skip":
-        if hasattr(dp, "waiting_for_photo"):
-            to_remove = []
-            for uid, pid in dp.waiting_for_photo:
-                if uid == user_id:
-                    to_remove.append((uid, pid))
-            for item in to_remove:
-                dp.waiting_for_photo.remove(item)
-            await message.answer("🛍 Вернуться в меню:", reply_markup=main_menu_keyboard(is_admin))
-        return
-    
-    # Добавление фото
-    if hasattr(dp, "waiting_for_photo"):
-        for uid, pid in list(dp.waiting_for_photo):
-            if uid == user_id and message.photo:
-                photo = message.photo[-1]
-                conn = sqlite3.connect(DB_PATH)
-                cursor = conn.cursor()
-                cursor.execute("UPDATE products SET photo = ? WHERE id = ?", (photo.file_id, pid))
-                conn.commit()
-                conn.close()
-                dp.waiting_for_photo.remove((uid, pid))
-                await message.answer("✅ Фото добавлено! Вернуться в меню:", reply_markup=main_menu_keyboard(is_admin))
-                return
-    
     # Изменение статуса заказа
     if hasattr(dp, "waiting_for_order_id") and user_id in dp.waiting_for_order_id:
         dp.waiting_for_order_id.remove(user_id)
@@ -1022,8 +963,13 @@ async def set_commands():
 
 async def main():
     init_db()
+    # Загружаем товары из Google Sheets при запуске
+    if GOOGLE_SHEETS_URL:
+        await load_products_from_google_sheets()
+    else:
+        logger.warning("GOOGLE_SHEETS_URL не задан, используем локальные товары")
     await set_commands()
-    logger.info("🛍 БОТ-МАГАЗИН ЗАПУЩЕН с верификацией номера и каруселью!")
+    logger.info("🛍 БОТ-МАГАЗИН ЗАПУЩЕН с Google Sheets интеграцией!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
