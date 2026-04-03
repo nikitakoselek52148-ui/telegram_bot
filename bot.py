@@ -46,7 +46,6 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # Таблица категорий (НОВАЯ)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS categories (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -54,7 +53,6 @@ def init_db():
         )
     ''')
     
-    # Таблица товаров (добавлено поле category_id)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -95,14 +93,12 @@ def init_db():
         )
     ''')
     
-    # Добавляем тестовые категории
     cursor.execute("SELECT COUNT(*) FROM categories")
     if cursor.fetchone()[0] == 0:
         test_categories = ["Обувь", "Одежда", "Аксессуары"]
         for cat in test_categories:
             cursor.execute("INSERT INTO categories (name) VALUES (?)", (cat,))
     
-    # Добавляем тестовые товары с категориями
     cursor.execute("SELECT COUNT(*) FROM products")
     if cursor.fetchone()[0] == 0:
         test_products = [
@@ -142,7 +138,6 @@ def add_category(name: str):
 def delete_category(category_id: int):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    # Сначала обновляем товары (убираем категорию)
     cursor.execute("UPDATE products SET category_id = NULL WHERE category_id = ?", (category_id,))
     cursor.execute("DELETE FROM categories WHERE id = ?", (category_id,))
     conn.commit()
@@ -436,7 +431,88 @@ async def show_cart(callback: CallbackQuery, user_id: int):
     text += f"\n**Итого: {total} ₽**"
     await callback.message.edit_text(text, reply_markup=cart_keyboard(), parse_mode="Markdown")
 
-# --- Обработчики ---
+# --- Настройка меню команд (появляется слева от поля ввода) ---
+async def set_commands():
+    commands = [
+        types.BotCommand(command="start", description="🛍 Главное меню"),
+        types.BotCommand(command="catalog", description="📋 Каталог товаров"),
+        types.BotCommand(command="cart", description="🛒 Моя корзина"),
+        types.BotCommand(command="orders", description="📦 Мои заказы"),
+        types.BotCommand(command="wishlist", description="❤️ Избранное"),
+        types.BotCommand(command="profile", description="👤 Мой профиль"),
+        types.BotCommand(command="help", description="❓ Помощь"),
+    ]
+    await bot.set_my_commands(commands)
+    logger.info("✅ Меню команд установлено")
+
+# --- Обработчики команд из меню ---
+
+@dp.message(Command("catalog"))
+async def catalog_command(message: types.Message):
+    await message.answer("📋 **Выберите категорию**", reply_markup=categories_keyboard(), parse_mode="Markdown")
+
+@dp.message(Command("cart"))
+async def cart_command(message: types.Message):
+    user_id = message.from_user.id
+    cart = get_cart(user_id)
+    if not cart:
+        await message.answer("🛒 **Корзина пуста**", reply_markup=main_menu_keyboard(user_id in ADMIN_IDS), parse_mode="Markdown")
+        return
+    total = 0
+    text = "🛒 **Ваша корзина**\n\n"
+    for item in cart:
+        subtotal = item['price'] * item['quantity']
+        total += subtotal
+        text += f"• {item['name']} x{item['quantity']} = {subtotal} ₽\n"
+    text += f"\n**Итого: {total} ₽**"
+    await message.answer(text, reply_markup=cart_keyboard(), parse_mode="Markdown")
+
+@dp.message(Command("orders"))
+async def orders_command(message: types.Message):
+    user_id = message.from_user.id
+    orders = get_user_orders(user_id)
+    if not orders:
+        await message.answer("📦 **У вас пока нет заказов**", parse_mode="Markdown")
+        return
+    text = "📦 **Ваши заказы**\n\n"
+    for order in orders:
+        status_emoji = "🟡" if order['status'] == "pending" else ("🟢" if order['status'] == "shipping" else ("✅" if order['status'] == "delivered" else "❌"))
+        text += f"{status_emoji} **Заказ #{order['id']}**\n📅 {order['order_date']}\n💰 {order['total']} ₽\n\n"
+    await message.answer(text, parse_mode="Markdown")
+
+@dp.message(Command("wishlist"))
+async def wishlist_command(message: types.Message):
+    user_id = message.from_user.id
+    wishlist = get_wishlist(user_id)
+    if not wishlist:
+        await message.answer("❤️ **Избранное пусто**", parse_mode="Markdown")
+        return
+    text = "❤️ **Ваше избранное**\n\n"
+    for item in wishlist:
+        text += f"• {item['name']} - {item['price']} ₽\n"
+    await message.answer(text, parse_mode="Markdown")
+
+@dp.message(Command("profile"))
+async def profile_command(message: types.Message):
+    user_id = message.from_user.id
+    orders = get_user_orders(user_id)
+    total_spent = sum(o['total'] for o in orders)
+    text = f"👤 **Ваш профиль**\n\n🆔 ID: {user_id}\n📦 Заказов: {len(orders)}\n💰 Потрачено: {total_spent} ₽\n🛒 Товаров в корзине: {len(get_cart(user_id))}\n❤️ В избранном: {len(get_wishlist(user_id))}"
+    await message.answer(text, parse_mode="Markdown")
+
+@dp.message(Command("help"))
+async def help_command(message: types.Message):
+    text = "❓ **Помощь**\n\n"
+    text += "📋 **/catalog** - посмотреть каталог\n"
+    text += "🛒 **/cart** - посмотреть корзину\n"
+    text += "📦 **/orders** - история заказов\n"
+    text += "❤️ **/wishlist** - избранное\n"
+    text += "👤 **/profile** - мой профиль\n"
+    text += "🔐 **/admin** - админ-панель (только для админа)\n\n"
+    text += "Также используйте кнопки под сообщениями для удобной навигации!"
+    await message.answer(text, parse_mode="Markdown")
+
+# --- Основные обработчики ---
 
 @dp.message(Command("start"))
 async def start_command(message: types.Message):
@@ -460,7 +536,6 @@ async def handle_callback(callback: CallbackQuery):
     elif data == "admin_panel" and is_admin:
         await callback.message.edit_text("🔐 **Панель администратора**", reply_markup=admin_panel_keyboard(), parse_mode="Markdown")
     
-    # --- Категории (для пользователей) ---
     elif data == "catalog":
         await callback.message.edit_text("📋 **Выберите категорию**", reply_markup=categories_keyboard(), parse_mode="Markdown")
     
@@ -475,7 +550,6 @@ async def handle_callback(callback: CallbackQuery):
                 break
         await show_product_list(callback, products, f"📋 **{cat_name}**\n\n", main_menu_keyboard(is_admin))
     
-    # --- Админ: управление категориями ---
     elif data == "admin_categories" and is_admin:
         await callback.message.edit_text("🏷️ **Управление категориями**", reply_markup=admin_categories_keyboard(), parse_mode="Markdown")
     
@@ -494,7 +568,6 @@ async def handle_callback(callback: CallbackQuery):
         await callback.message.answer("✅ Категория удалена!")
         await callback.message.edit_text("🏷️ **Управление категориями**", reply_markup=admin_categories_keyboard(), parse_mode="Markdown")
     
-    # --- Карточка товара ---
     elif data.startswith("product_"):
         product_id = int(data.split("_")[1])
         product = get_product(product_id)
@@ -510,7 +583,6 @@ async def handle_callback(callback: CallbackQuery):
         else:
             await callback.message.edit_text(text, reply_markup=product_card_keyboard(product_id, user_id, in_cart), parse_mode="Markdown")
     
-    # --- Корзина ---
     elif data.startswith("add_to_cart_"):
         product_id = int(data.split("_")[3])
         add_to_cart(user_id, product_id)
@@ -694,4 +766,127 @@ async def handle_callback(callback: CallbackQuery):
         keyboard = InlineKeyboardMarkup(inline_keyboard=[])
         for cat in categories:
             keyboard.inline_keyboard.append([InlineKeyboardButton(text=f"📁 {cat[1]}", callback_data=f"admin_select_category_{cat[0]}")])
-        keyboard.inline_keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data
+        keyboard.inline_keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel")])
+        await callback.message.edit_text("📝 **Выберите категорию для товара**", reply_markup=keyboard, parse_mode="Markdown")
+        dp.waiting_for_product_category = getattr(dp, "waiting_for_product_category", set())
+        dp.waiting_for_product_category.add(user_id)
+    
+    elif data.startswith("admin_select_category_") and is_admin:
+        category_id = int(data.split("_")[3])
+        dp.selected_category = category_id
+        await callback.message.edit_text(
+            "📝 **Добавление товара**\n\nОтправьте данные в формате:\n`Название | Цена | Описание`\n\nПример:\n`Кроссовки Nike | 8900 | Спортивные кроссовки`",
+            parse_mode="Markdown"
+        )
+        dp.awaiting_product = getattr(dp, "awaiting_product", set())
+        dp.awaiting_product.add(user_id)
+    
+    elif data == "admin_update_status" and is_admin:
+        await callback.message.edit_text(
+            "🔄 **Изменение статуса заказа**\n\nВведите номер заказа:",
+            reply_markup=admin_panel_keyboard(),
+            parse_mode="Markdown"
+        )
+        dp.waiting_for_order_id = getattr(dp, "waiting_for_order_id", set())
+        dp.waiting_for_order_id.add(user_id)
+
+# --- Обработка ввода ---
+
+@dp.message()
+async def handle_input(message: types.Message):
+    user_id = message.from_user.id
+    is_admin = user_id in ADMIN_IDS
+    
+    # Добавление категории
+    if hasattr(dp, "waiting_for_category") and user_id in dp.waiting_for_category:
+        dp.waiting_for_category.remove(user_id)
+        cat_name = message.text.strip()
+        if cat_name:
+            try:
+                add_category(cat_name)
+                await message.answer(f"✅ Категория «{cat_name}» добавлена!")
+            except:
+                await message.answer("❌ Такая категория уже существует!")
+        else:
+            await message.answer("❌ Название не может быть пустым")
+        await message.answer("🔐 Вернуться в админ-панель:", reply_markup=admin_panel_keyboard())
+        return
+    
+    # Добавление товара
+    if hasattr(dp, "awaiting_product") and user_id in dp.awaiting_product:
+        dp.awaiting_product.remove(user_id)
+        try:
+            parts = message.text.split("|")
+            if len(parts) >= 3:
+                name = parts[0].strip()
+                price = int(parts[1].strip())
+                desc = parts[2].strip()
+                category_id = getattr(dp, "selected_category", None)
+                product_id = add_product(name, price, desc, category_id)
+                await message.answer(f"✅ Товар «{name}» добавлен! ID: {product_id}")
+                
+                # Спросить про фото
+                await message.answer("📸 Хотите добавить фото товара? Отправьте фото сейчас или нажмите /skip")
+                dp.waiting_for_photo = getattr(dp, "waiting_for_photo", set())
+                dp.waiting_for_photo.add((user_id, product_id))
+            else:
+                await message.answer("❌ Неверный формат. Используйте: `Название | Цена | Описание`", parse_mode="Markdown")
+        except ValueError:
+            await message.answer("❌ Цена должна быть числом")
+        except Exception as e:
+            await message.answer(f"❌ Ошибка: {e}")
+        return
+    
+    # Пропуск фото
+    if message.text == "/skip":
+        if hasattr(dp, "waiting_for_photo"):
+            to_remove = []
+            for uid, pid in dp.waiting_for_photo:
+                if uid == user_id:
+                    to_remove.append((uid, pid))
+            for item in to_remove:
+                dp.waiting_for_photo.remove(item)
+            await message.answer("🛍 Вернуться в меню:", reply_markup=main_menu_keyboard(is_admin))
+        return
+    
+    # Добавление фото
+    if hasattr(dp, "waiting_for_photo"):
+        for uid, pid in list(dp.waiting_for_photo):
+            if uid == user_id and message.photo:
+                photo = message.photo[-1]
+                update_product_photo(pid, photo.file_id)
+                dp.waiting_for_photo.remove((uid, pid))
+                await message.answer("✅ Фото добавлено! Вернуться в меню:", reply_markup=main_menu_keyboard(is_admin))
+                return
+    
+    # Изменение статуса заказа
+    if hasattr(dp, "waiting_for_order_id") and user_id in dp.waiting_for_order_id:
+        dp.waiting_for_order_id.remove(user_id)
+        try:
+            order_id = int(message.text.strip())
+            current_status = None
+            for order in get_all_orders():
+                if order['id'] == order_id:
+                    current_status = order['status']
+                    break
+            if current_status:
+                await message.answer(f"🔄 **Заказ #{order_id}**\n\nТекущий статус: {current_status}\n\nВыберите новый статус:", reply_markup=update_status_keyboard(order_id, current_status), parse_mode="Markdown")
+            else:
+                await message.answer(f"❌ Заказ #{order_id} не найден")
+        except ValueError:
+            await message.answer("❌ Введите номер заказа (цифрами)")
+        return
+    
+    # Обычное сообщение
+    await message.answer("🛍 Используйте кнопки для навигации.", reply_markup=main_menu_keyboard(is_admin))
+
+# --- Запуск ---
+async def main():
+    init_db()
+    await set_commands()
+    logger.info("🛍 БОТ-МАГАЗИН ЗАПУЩЕН")
+    logger.info("📋 Меню команд установлено")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
