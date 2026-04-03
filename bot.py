@@ -4,7 +4,7 @@ import logging
 import sqlite3
 import threading
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -101,21 +101,6 @@ def init_db():
         )
     ''')
     
-    # Таблица новостей (с типом: news или product)
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS news (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            content TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            publish_at TEXT,
-            photo TEXT,
-            news_type TEXT DEFAULT 'news',
-            product_id INTEGER,
-            is_published INTEGER DEFAULT 0
-        )
-    ''')
-    
     # Добавляем тестовые товары
     cursor.execute("SELECT COUNT(*) FROM products")
     if cursor.fetchone()[0] == 0:
@@ -134,98 +119,50 @@ def init_db():
     conn.close()
     logger.info("База данных инициализирована")
 
-# --- Функции новостей ---
-def get_published_news(limit: int = 20):
-    """Получить опубликованные новости (включая товары-новости)"""
+# --- Функции для рассылок ---
+def get_all_users():
+    """Получить всех пользователей для рассылки"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    now = datetime.now().strftime("%d.%m.%Y %H:%M")
-    cursor.execute('''
-        SELECT id, title, content, created_at, photo, news_type, product_id
-        FROM news 
-        WHERE is_published = 1 AND (publish_at IS NULL OR publish_at <= ?)
-        ORDER BY id DESC LIMIT ?
-    ''', (now, limit))
-    news = cursor.fetchall()
+    cursor.execute("SELECT user_id FROM users")
+    users = cursor.fetchall()
     conn.close()
-    result = []
-    for n in news:
-        item = {
-            'id': n[0], 
-            'title': n[1], 
-            'content': n[2], 
-            'created_at': n[3], 
-            'photo': n[4],
-            'news_type': n[5],
-            'product_id': n[6]
-        }
-        # Если это товар-новость, добавляем информацию о товаре
-        if n[5] == 'product' and n[6]:
-            product = get_product(n[6])
-            if product:
-                item['product'] = product
-        result.append(item)
-    return result
+    return [u[0] for u in users]
 
-def get_all_news(limit: int = 30):
-    """Получить все новости (для админа)"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT id, title, content, created_at, publish_at, photo, news_type, product_id, is_published 
-        FROM news ORDER BY id DESC LIMIT ?
-    ''', (limit,))
-    news = cursor.fetchall()
-    conn.close()
-    return [{
-        'id': n[0], 'title': n[1], 'content': n[2], 'created_at': n[3], 
-        'publish_at': n[4], 'photo': n[5], 'news_type': n[6], 
-        'product_id': n[7], 'is_published': n[8]
-    } for n in news]
-
-def add_news(title: str, content: str, publish_in_hours: int = None, photo: str = None, news_type: str = 'news', product_id: int = None):
-    """Добавить новость (обычную или товар) с отложенной публикацией"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    created_at = datetime.now().strftime("%d.%m.%Y %H:%M")
-    publish_at = None
-    if publish_in_hours:
-        publish_at = (datetime.now() + timedelta(hours=publish_in_hours)).strftime("%d.%m.%Y %H:%M")
-    cursor.execute(
-        "INSERT INTO news (title, content, created_at, publish_at, photo, news_type, product_id, is_published) VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
-        (title, content, created_at, publish_at, photo, news_type, product_id)
-    )
-    conn.commit()
-    news_id = cursor.lastrowid
-    conn.close()
-    return news_id
-
-def publish_news(news_id: int):
-    """Опубликовать новость"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("UPDATE news SET is_published = 1 WHERE id = ?", (news_id,))
-    conn.commit()
-    conn.close()
-
-def delete_news(news_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM news WHERE id = ?", (news_id,))
-    conn.commit()
-    conn.close()
-
-def publish_scheduled_news():
-    """Публикует запланированные новости (вызывать периодически)"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    now = datetime.now().strftime("%d.%m.%Y %H:%M")
-    cursor.execute('''
-        UPDATE news SET is_published = 1 
-        WHERE is_published = 0 AND publish_at IS NOT NULL AND publish_at <= ?
-    ''', (now,))
-    conn.commit()
-    conn.close()
+async def send_broadcast_to_all(message_text: str, photo: str = None, product_id: int = None):
+    """Отправляет сообщение всем пользователям"""
+    users = get_all_users()
+    success = 0
+    fail = 0
+    
+    for user_id in users:
+        try:
+            if product_id:
+                # Товар-новость с кнопкой
+                product = get_product(product_id)
+                if product:
+                    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="🛒 Добавить в корзину", callback_data=f"add_to_cart_{product_id}")],
+                        [InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_to_main")]
+                    ])
+                    if photo:
+                        await bot.send_photo(user_id, photo, caption=message_text, reply_markup=keyboard)
+                    else:
+                        await bot.send_message(user_id, message_text, reply_markup=keyboard)
+                else:
+                    await bot.send_message(user_id, message_text)
+            else:
+                # Обычная новость
+                if photo:
+                    await bot.send_photo(user_id, photo, caption=message_text)
+                else:
+                    await bot.send_message(user_id, message_text)
+            success += 1
+        except Exception as e:
+            fail += 1
+            logger.error(f"Ошибка отправки пользователю {user_id}: {e}")
+    
+    return success, fail
 
 # --- Функции пользователей ---
 def register_user(user_id: int, phone: str = None, first_name: str = None, last_name: str = None, username: str = None):
@@ -456,7 +393,7 @@ def main_menu_keyboard(is_admin=False):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 Каталог", callback_data="catalog"), InlineKeyboardButton(text="🛒 Корзина", callback_data="cart")],
         [InlineKeyboardButton(text="📦 Мои заказы", callback_data="my_orders"), InlineKeyboardButton(text="❤️ Избранное", callback_data="wishlist")],
-        [InlineKeyboardButton(text="👤 Профиль", callback_data="profile"), InlineKeyboardButton(text="📰 Новости", callback_data="news")]
+        [InlineKeyboardButton(text="👤 Профиль", callback_data="profile")]
     ])
     if is_admin:
         keyboard.inline_keyboard.append([InlineKeyboardButton(text="🔐 Админ панель", callback_data="admin_panel")])
@@ -466,27 +403,14 @@ def admin_panel_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats"), InlineKeyboardButton(text="➕ Добавить товар", callback_data="admin_add_product")],
         [InlineKeyboardButton(text="📋 Товары", callback_data="admin_products"), InlineKeyboardButton(text="📦 Заказы", callback_data="admin_orders")],
-        [InlineKeyboardButton(text="🔄 Статусы заказов", callback_data="admin_update_status"), InlineKeyboardButton(text="📰 Управление новостями", callback_data="admin_news")],
+        [InlineKeyboardButton(text="🔄 Статусы заказов", callback_data="admin_update_status"), InlineKeyboardButton(text="📢 Создать рассылку", callback_data="admin_create_broadcast")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
     ])
 
-def admin_news_keyboard():
+def broadcast_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Обычная новость", callback_data="admin_add_news"), InlineKeyboardButton(text="🛍 Товар-новость", callback_data="admin_add_product_news")],
-        [InlineKeyboardButton(text="📋 Список новостей", callback_data="admin_list_news")],
+        [InlineKeyboardButton(text="📰 Обычная новость", callback_data="broadcast_news"), InlineKeyboardButton(text="🛍 Товар-новость", callback_data="broadcast_product")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel")]
-    ])
-
-def news_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data="news")],
-        [InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_to_main")]
-    ])
-
-def product_news_keyboard(product_id: int):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🛒 Добавить в корзину", callback_data=f"add_to_cart_{product_id}")],
-        [InlineKeyboardButton(text="🔙 К новостям", callback_data="news"), InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_to_main")]
     ])
 
 def cart_keyboard():
@@ -567,7 +491,7 @@ async def start_command(message: types.Message):
     text = "🛍 <b>Добро пожаловать в магазин!</b>\n\n"
     if phone:
         text += f"📱 Ваш номер: {phone}\n\n"
-    text += "• 📋 Каталог\n• 🛒 Корзина\n• 📦 Мои заказы\n• ❤️ Избранное\n• 👤 Профиль\n• 📰 Новости"
+    text += "• 📋 Каталог\n• 🛒 Корзина\n• 📦 Мои заказы\n• ❤️ Избранное\n• 👤 Профиль"
     
     if is_admin:
         text += "\n\n🔐 <b>Вы вошли как администратор</b>"
@@ -596,7 +520,7 @@ async def handle_contact(message: types.Message):
     )
     
     text = "🛍 <b>Добро пожаловать в магазин!</b>\n\n"
-    text += "• 📋 Каталог\n• 🛒 Корзина\n• 📦 Мои заказы\n• ❤️ Избранное\n• 👤 Профиль\n• 📰 Новости"
+    text += "• 📋 Каталог\n• 🛒 Корзина\n• 📦 Мои заказы\n• ❤️ Избранное\n• 👤 Профиль"
     
     if is_admin:
         text += "\n\n🔐 <b>Вы вошли как администратор</b>"
@@ -618,44 +542,53 @@ async def handle_callback(callback: CallbackQuery):
     is_admin = user_id in ADMIN_IDS
     await callback.answer()
     
-    # --- Новости ---
-    if data == "news":
-        news_list = get_published_news()
-        if not news_list:
-            await callback.message.edit_text("📰 <b>Новостей пока нет</b>", reply_markup=main_menu_keyboard(is_admin), parse_mode="HTML")
-            return
-        
-        # Отправляем первую новость
-        await send_news_message(callback.message, news_list, 0)
-        try:
-            await callback.message.delete()
-        except:
-            pass
+    # --- Админ: создание рассылки ---
+    if data == "admin_create_broadcast" and is_admin:
+        await callback.message.edit_text(
+            "📢 <b>Создание рассылки</b>\n\n"
+            "Выберите тип:",
+            reply_markup=broadcast_keyboard(),
+            parse_mode="HTML"
+        )
         return
     
-    if data.startswith("news_"):
-        parts = data.split("_")
-        news_id = int(parts[1])
-        action = parts[2] if len(parts) > 2 else None
+    elif data == "broadcast_news" and is_admin:
+        await callback.message.edit_text(
+            "📰 <b>Обычная новость</b>\n\n"
+            "Отправьте текст новости:",
+            parse_mode="HTML"
+        )
+        dp.awaiting_broadcast = getattr(dp, "awaiting_broadcast", {})
+        dp.awaiting_broadcast[user_id] = {"type": "news"}
+        return
+    
+    elif data == "broadcast_product" and is_admin:
+        products = get_products()
+        if not products:
+            await callback.message.edit_text("❌ Сначала добавьте товары в каталог!", reply_markup=admin_panel_keyboard(), parse_mode="HTML")
+            return
         
-        if action == "prev":
-            current = int(parts[3]) if len(parts) > 3 else 0
-            news_list = get_published_news()
-            new_index = (current - 1) % len(news_list)
-            await send_news_message(callback.message, news_list, new_index)
-            try:
-                await callback.message.delete()
-            except:
-                pass
-        elif action == "next":
-            current = int(parts[3]) if len(parts) > 3 else 0
-            news_list = get_published_news()
-            new_index = (current + 1) % len(news_list)
-            await send_news_message(callback.message, news_list, new_index)
-            try:
-                await callback.message.delete()
-            except:
-                pass
+        text = "🛍 <b>Выберите товар для новости</b>\n\n"
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+        for p in products:
+            keyboard.inline_keyboard.append([
+                InlineKeyboardButton(text=f"{p['name']} - {p['price']} ₽", callback_data=f"select_product_for_broadcast_{p['id']}")
+            ])
+        keyboard.inline_keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="admin_create_broadcast")])
+        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+        return
+    
+    elif data.startswith("select_product_for_broadcast_") and is_admin:
+        product_id = int(data.split("_")[4])
+        dp.selected_product_for_broadcast = getattr(dp, "selected_product_for_broadcast", {})
+        dp.selected_product_for_broadcast[user_id] = product_id
+        await callback.message.edit_text(
+            "📝 <b>Товар-новость</b>\n\n"
+            "Отправьте текст новости:",
+            parse_mode="HTML"
+        )
+        dp.awaiting_broadcast = getattr(dp, "awaiting_broadcast", {})
+        dp.awaiting_broadcast[user_id] = {"type": "product", "product_id": product_id}
         return
     
     # --- Карусель ---
@@ -725,7 +658,7 @@ async def handle_callback(callback: CallbackQuery):
             pass
         return
     
-    # --- Добавление в корзину из новостей ---
+    # --- Добавление в корзину ---
     if data.startswith("add_to_cart_"):
         product_id = int(data.split("_")[3])
         add_to_cart(user_id, product_id)
@@ -742,86 +675,6 @@ async def handle_callback(callback: CallbackQuery):
     
     elif data == "admin_panel" and is_admin:
         await callback.message.edit_text("🔐 <b>Панель администратора</b>", reply_markup=admin_panel_keyboard(), parse_mode="HTML")
-    
-    elif data == "admin_news" and is_admin:
-        await callback.message.edit_text("📰 <b>Управление новостями</b>", reply_markup=admin_news_keyboard(), parse_mode="HTML")
-    
-    # --- Добавление обычной новости ---
-    elif data == "admin_add_news" and is_admin:
-        await callback.message.edit_text(
-            "📝 <b>Добавление обычной новости</b>\n\n"
-            "Отправьте данные в формате:\n"
-            "<code>Заголовок | Текст</code>\n\n"
-            "Пример:\n"
-            "<code>Акция! | Скидка 20% на всю обувь до конца недели!</code>\n\n"
-            "📸 Чтобы добавить фото, отправьте фото после текста.\n"
-            "⏰ Чтобы отложить публикацию, добавьте | часы (например: | 2)\n\n"
-            "<code>Акция! | Скидка 20%! | 3</code> — опубликуется через 3 часа",
-            parse_mode="HTML"
-        )
-        dp.awaiting_news = getattr(dp, "awaiting_news", {})
-        dp.awaiting_news[user_id] = {"type": "news"}
-    
-    # --- Добавление товара-новости ---
-    elif data == "admin_add_product_news" and is_admin:
-        products = get_products()
-        if not products:
-            await callback.message.edit_text("❌ Сначала добавьте товары в каталог!", reply_markup=admin_news_keyboard(), parse_mode="HTML")
-            return
-        
-        text = "🛍 <b>Выберите товар для новости</b>\n\n"
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[])
-        for p in products:
-            keyboard.inline_keyboard.append([
-                InlineKeyboardButton(text=f"{p['name']} - {p['price']} ₽", callback_data=f"select_product_for_news_{p['id']}")
-            ])
-        keyboard.inline_keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="admin_news")])
-        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
-    
-    elif data.startswith("select_product_for_news_") and is_admin:
-        product_id = int(data.split("_")[4])
-        dp.selected_product_for_news = getattr(dp, "selected_product_for_news", {})
-        dp.selected_product_for_news[user_id] = product_id
-        await callback.message.edit_text(
-            "📝 <b>Добавление товара-новости</b>\n\n"
-            "Отправьте текст новости:\n"
-            "Пример:\n"
-            "<code>🔥 Новое поступление! Успейте купить!</code>\n\n"
-            "📸 Чтобы добавить фото, отправьте фото после текста.\n"
-            "⏰ Чтобы отложить публикацию, добавьте | часы\n\n"
-            "<code>Новинка! | 2</code> — опубликуется через 2 часа",
-            parse_mode="HTML"
-        )
-        dp.awaiting_news = getattr(dp, "awaiting_news", {})
-        dp.awaiting_news[user_id] = {"type": "product_news", "product_id": product_id}
-    
-    # --- Список новостей для админа ---
-    elif data == "admin_list_news" and is_admin:
-        news_list = get_all_news()
-        if not news_list:
-            await callback.message.edit_text("📰 <b>Нет новостей</b>", reply_markup=admin_news_keyboard(), parse_mode="HTML")
-            return
-        
-        text = "📰 <b>Все новости</b>\n\n"
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[])
-        for n in news_list:
-            status = "✅" if n['is_published'] else "⏳"
-            type_emoji = "🛍" if n['news_type'] == 'product' else "📰"
-            text += f"{status} {type_emoji} {n['title'][:30]}...\n"
-            text += f"📅 {n['created_at']}"
-            if n['publish_at'] and not n['is_published']:
-                text += f" (до {n['publish_at']})"
-            text += "\n"
-            keyboard.inline_keyboard.append([
-                InlineKeyboardButton(text=f"❌ Удалить #{n['id']}", callback_data=f"admin_delete_news_{n['id']}")
-            ])
-        keyboard.inline_keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="admin_news")])
-        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
-    
-    elif data.startswith("admin_delete_news_") and is_admin:
-        news_id = int(data.split("_")[3])
-        delete_news(news_id)
-        await callback.message.answer(f"✅ Новость #{news_id} удалена!")
     
     # --- Корзина ---
     elif data == "cart":
@@ -1077,44 +930,6 @@ async def update_cart_message(callback: CallbackQuery, user_id: int, is_admin: b
     
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
 
-async def send_news_message(message: types.Message, news_list, index):
-    """Отправляет одну новость из списка"""
-    if not news_list or index >= len(news_list):
-        await message.answer("📰 Новостей пока нет")
-        return
-    
-    news = news_list[index]
-    total = len(news_list)
-    
-    # Формируем текст
-    text = f"📰 <b>{news['title']}</b>\n\n{news['content']}\n\n📅 {news['created_at']}"
-    
-    # Клавиатура для навигации
-    nav_buttons = []
-    if total > 1:
-        nav_buttons = [
-            InlineKeyboardButton(text="◀️", callback_data=f"news_{news['id']}_prev_{index}"),
-            InlineKeyboardButton(text=f"{index+1}/{total}", callback_data="news_info"),
-            InlineKeyboardButton(text="▶️", callback_data=f"news_{news['id']}_next_{index}")
-        ]
-    
-    # Если это товар-новость, добавляем кнопку "В корзину"
-    if news.get('news_type') == 'product' and news.get('product'):
-        product = news['product']
-        keyboard_buttons = [nav_buttons] if nav_buttons else []
-        keyboard_buttons.append([InlineKeyboardButton(text="🛒 Добавить в корзину", callback_data=f"add_to_cart_{product['id']}")])
-        keyboard_buttons.append([InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_to_main")])
-        keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-    else:
-        keyboard_buttons = [nav_buttons] if nav_buttons else []
-        keyboard_buttons.append([InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_to_main")])
-        keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-    
-    if news.get('photo'):
-        await message.answer_photo(photo=news['photo'], caption=text, reply_markup=keyboard)
-    else:
-        await message.answer(text, reply_markup=keyboard)
-
 @dp.message()
 async def handle_input(message: types.Message):
     user_id = message.from_user.id
@@ -1131,6 +946,11 @@ async def handle_input(message: types.Message):
                 desc = parts[2].strip()
                 product_id = add_product(name, price, desc)
                 await message.answer(f"✅ Товар «{name}» добавлен! ID: {product_id}")
+                
+                # Предлагаем добавить фото
+                await message.answer("📸 Хотите добавить фото товара? Отправьте фото сейчас или нажмите /skip")
+                dp.waiting_for_photo = getattr(dp, "waiting_for_photo", set())
+                dp.waiting_for_photo.add((user_id, product_id))
             else:
                 await message.answer("❌ Неверный формат. Используйте: <code>Название | Цена | Описание</code>", parse_mode="HTML")
         except ValueError:
@@ -1139,64 +959,76 @@ async def handle_input(message: types.Message):
             await message.answer(f"❌ Ошибка: {e}")
         return
     
-    # Добавление новости
-    if hasattr(dp, "awaiting_news") and user_id in dp.awaiting_news:
-        news_data = dp.awaiting_news[user_id]
-        text = message.text.strip()
-        
-        # Парсим часы отложенной публикации
-        publish_in_hours = None
-        if " | " in text:
-            parts = text.split(" | ")
-            text = parts[0].strip()
-            if len(parts) > 1 and parts[1].isdigit():
-                publish_in_hours = int(parts[1])
-        
-        if news_data["type"] == "news":
-            # Обычная новость: ожидаем "Заголовок | Текст"
-            if " | " in text:
-                parts = text.split(" | ", 1)
-                title = parts[0].strip()
-                content = parts[1].strip()
-                add_news(title=title, content=content, publish_in_hours=publish_in_hours)
-                await message.answer(f"✅ Новость «{title}» добавлена!{' Опубликуется через ' + str(publish_in_hours) + ' ч.' if publish_in_hours else ''}")
-            else:
-                await message.answer("❌ Неверный формат. Используйте: <code>Заголовок | Текст</code>", parse_mode="HTML")
-        else:
-            # Товар-новость
-            product_id = news_data["product_id"]
-            product = get_product(product_id)
-            if product:
-                title = f"🛍 {product['name']}"
-                content = text
-                add_news(title=title, content=content, publish_in_hours=publish_in_hours, news_type='product', product_id=product_id)
-                await message.answer(f"✅ Товар-новость «{title}» добавлена!{' Опубликуется через ' + str(publish_in_hours) + ' ч.' if publish_in_hours else ''}")
-            else:
-                await message.answer("❌ Товар не найден")
-        
-        # Предлагаем добавить фото
-        await message.answer("📸 Хотите добавить фото к новости? Отправьте фото сейчас или нажмите /skip")
-        dp.waiting_for_news_photo = getattr(dp, "waiting_for_news_photo", {})
-        dp.waiting_for_news_photo[user_id] = {"news_id": None, "type": news_data["type"]}
+    # Добавление фото к товару
+    if hasattr(dp, "waiting_for_photo"):
+        for uid, pid in list(dp.waiting_for_photo):
+            if uid == user_id and message.photo:
+                photo = message.photo[-1]
+                conn = sqlite3.connect(DB_PATH)
+                cursor = conn.cursor()
+                cursor.execute("UPDATE products SET photo = ? WHERE id = ?", (photo.file_id, pid))
+                conn.commit()
+                conn.close()
+                dp.waiting_for_photo.remove((uid, pid))
+                await message.answer("✅ Фото добавлено!")
+                return
+    
+    if message.text == "/skip":
+        if hasattr(dp, "waiting_for_photo"):
+            to_remove = []
+            for uid, pid in dp.waiting_for_photo:
+                if uid == user_id:
+                    to_remove.append((uid, pid))
+            for item in to_remove:
+                dp.waiting_for_photo.remove(item)
+            await message.answer("✅ Фото не добавлено")
         return
     
-    # Добавление фото к новости
-    if hasattr(dp, "waiting_for_news_photo") and user_id in dp.waiting_for_news_photo:
+    # Создание рассылки
+    if hasattr(dp, "awaiting_broadcast") and user_id in dp.awaiting_broadcast:
+        broadcast_data = dp.awaiting_broadcast[user_id]
+        text = message.text.strip()
+        
+        # Отправляем рассылку
+        success, fail = await send_broadcast_to_all(
+            message_text=text,
+            product_id=broadcast_data.get("product_id") if broadcast_data["type"] == "product" else None
+        )
+        
+        await message.answer(f"✅ Рассылка отправлена!\n\n📨 Получили: {success}\n❌ Не доставлено: {fail}")
+        
+        # Предлагаем добавить фото
+        if broadcast_data["type"] == "news":
+            await message.answer("📸 Хотите добавить фото к новости? Отправьте фото сейчас или нажмите /skip")
+            dp.waiting_for_broadcast_photo = getattr(dp, "waiting_for_broadcast_photo", {})
+            dp.waiting_for_broadcast_photo[user_id] = {"text": text, "type": broadcast_data["type"]}
+        else:
+            await message.answer("📸 Хотите добавить фото к товару-новости? Отправьте фото сейчас или нажмите /skip")
+            dp.waiting_for_broadcast_photo = getattr(dp, "waiting_for_broadcast_photo", {})
+            dp.waiting_for_broadcast_photo[user_id] = {"text": text, "type": broadcast_data["type"], "product_id": broadcast_data.get("product_id")}
+        
+        del dp.awaiting_broadcast[user_id]
+        return
+    
+    # Добавление фото к рассылке (дополнительная отправка с фото)
+    if hasattr(dp, "waiting_for_broadcast_photo") and user_id in dp.waiting_for_broadcast_photo:
+        data = dp.waiting_for_broadcast_photo[user_id]
+        
         if message.text == "/skip":
-            del dp.waiting_for_news_photo[user_id]
+            del dp.waiting_for_broadcast_photo[user_id]
             await message.answer("✅ Фото не добавлено", reply_markup=admin_panel_keyboard() if is_admin else main_menu_keyboard(is_admin))
             return
         
         if message.photo:
             photo = message.photo[-1]
-            # Обновляем последнюю добавленную новость с фото
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute("UPDATE news SET photo = ? WHERE id = (SELECT MAX(id) FROM news)", (photo.file_id,))
-            conn.commit()
-            conn.close()
-            del dp.waiting_for_news_photo[user_id]
-            await message.answer("✅ Фото добавлено к новости!", reply_markup=admin_panel_keyboard() if is_admin else main_menu_keyboard(is_admin))
+            # Отправляем повторно с фото
+            success, fail = await send_broadcast_to_all(
+                message_text=data["text"],
+                photo=photo.file_id,
+                product_id=data.get("product_id") if data["type"] == "product" else None
+            )
+            del dp.waiting_for_broadcast_photo[user_id]
+            await message.answer(f"✅ Рассылка с фото отправлена!\n\n📨 Получили: {success}\n❌ Не доставлено: {fail}", reply_markup=admin_panel_keyboard() if is_admin else main_menu_keyboard(is_admin))
         return
     
     # Изменение статуса заказа
@@ -1217,7 +1049,6 @@ async def handle_input(message: types.Message):
             await message.answer("❌ Введите номер заказа (цифрами)")
         return
 
-# --- Настройка меню команд ---
 async def set_commands():
     commands = [
         types.BotCommand(command="start", description="🛍 Главное меню"),
@@ -1226,22 +1057,10 @@ async def set_commands():
     await bot.set_my_commands(commands)
     logger.info("✅ Меню команд установлено")
 
-# --- Фоновая задача для публикации отложенных новостей ---
-async def scheduler():
-    """Проверяет каждую минуту, не пора ли опубликовать новости"""
-    while True:
-        try:
-            publish_scheduled_news()
-        except Exception as e:
-            logger.error(f"Ошибка в планировщике: {e}")
-        await asyncio.sleep(60)  # Проверяем каждую минуту
-
 async def main():
     init_db()
     await set_commands()
-    # Запускаем фоновую задачу
-    asyncio.create_task(scheduler())
-    logger.info("🛍 БОТ-МАГАЗИН ЗАПУЩЕН с отложенными новостями")
+    logger.info("🛍 БОТ-МАГАЗИН ЗАПУЩЕН с рассылкой новостей")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
