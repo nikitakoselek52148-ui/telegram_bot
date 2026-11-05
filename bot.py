@@ -17,6 +17,9 @@ load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 ADMIN_IDS = [1912287053]
 
+
+
+
 if not BOT_TOKEN:
     raise ValueError("Токен не найден!")
 
